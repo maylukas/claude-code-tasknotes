@@ -53,7 +53,7 @@ func TestRenderNeedsActionSection_GroupingAndWikilinks(t *testing.T) {
 		{Path: "Tasks/Answer me.md", Title: "Answer me", Status: "needs-input", Projects: []string{"[[E2E Tests]]", "[[Ignored Second]]"}},
 		{Path: "Tasks/Not relevant.md", Title: "Not relevant", Status: "in-progress"},
 	}
-	section := renderNeedsActionSection(tasks, false, nil)
+	section := renderNeedsActionSection(tasks, false, nil, nil)
 
 	if !strings.HasPrefix(section, "## Needs your action\n\n") {
 		t.Fatalf("expected section header prefix, got:\n%s", section)
@@ -94,7 +94,7 @@ func TestRenderNeedsActionSection_MrLink(t *testing.T) {
 		{Path: "Tasks/Triage me.md", Title: "Triage me", Status: "triage", CustomProperties: map[string]string{"mr": "https://example.com/mr/2"}},
 		{Path: "Tasks/No mr.md", Title: "No mr", Status: "needs-input"},
 	}
-	section := renderNeedsActionSection(tasks, false, nil)
+	section := renderNeedsActionSection(tasks, false, nil, nil)
 
 	if !strings.Contains(section, "- [[Tasks/Review me]] — Review me — [MR](https://example.com/mr/1)\n") {
 		t.Errorf("expected review line with MR link, got:\n%s", section)
@@ -119,7 +119,7 @@ func TestRenderNeedsActionSection_MrState(t *testing.T) {
 		{Path: "Tasks/Unknown state.md", Title: "Unknown state", Status: "review", CustomProperties: map[string]string{"mr": "https://example.com/mr/2"}},
 	}
 	mrStates := map[string]string{"Tasks/Review me.md": "opened"}
-	section := renderNeedsActionSection(tasks, false, mrStates)
+	section := renderNeedsActionSection(tasks, false, mrStates, nil)
 
 	if !strings.Contains(section, "- [[Tasks/Review me]] — Review me — [MR](https://example.com/mr/1) (opened)\n") {
 		t.Errorf("expected the MR link followed by its known state, got:\n%s", section)
@@ -129,10 +129,30 @@ func TestRenderNeedsActionSection_MrState(t *testing.T) {
 	}
 }
 
+// TestRenderNeedsActionSection_MrOpenThreads verifies a nonzero open-thread
+// count is appended after the MR state annotation, and omitted entirely
+// when the count is zero or unknown.
+func TestRenderNeedsActionSection_MrOpenThreads(t *testing.T) {
+	tasks := []Task{
+		{Path: "Tasks/Threads.md", Title: "Has threads", Status: "review", CustomProperties: map[string]string{"mr": "https://example.com/mr/1"}},
+		{Path: "Tasks/NoThreads.md", Title: "No threads", Status: "review", CustomProperties: map[string]string{"mr": "https://example.com/mr/2"}},
+	}
+	mrStates := map[string]string{"Tasks/Threads.md": "opened", "Tasks/NoThreads.md": "opened"}
+	mrOpenThreads := map[string]int{"Tasks/Threads.md": 2, "Tasks/NoThreads.md": 0}
+	section := renderNeedsActionSection(tasks, false, mrStates, mrOpenThreads)
+
+	if !strings.Contains(section, "- [[Tasks/Threads]] — Has threads — [MR](https://example.com/mr/1) (opened), 2 unresolved thread(s)\n") {
+		t.Errorf("expected the open-thread count appended after the state, got:\n%s", section)
+	}
+	if !strings.Contains(section, "- [[Tasks/NoThreads]] — No threads — [MR](https://example.com/mr/2) (opened)\n") {
+		t.Errorf("expected no thread-count suffix when the count is zero, got:\n%s", section)
+	}
+}
+
 // TestRenderNeedsActionSection_EmptyState verifies the "nothing needs you"
 // fallback when there are no matching tasks.
 func TestRenderNeedsActionSection_EmptyState(t *testing.T) {
-	section := renderNeedsActionSection(nil, false, nil)
+	section := renderNeedsActionSection(nil, false, nil, nil)
 	if !strings.Contains(section, "_Nothing needs you._") {
 		t.Errorf("expected empty-state copy, got:\n%s", section)
 	}
@@ -145,7 +165,7 @@ func TestRenderNeedsActionSection_EmptyState(t *testing.T) {
 // when the TaskNotes API couldn't be reached, and that it takes priority
 // over any (stale/irrelevant) tasks slice passed alongside it.
 func TestRenderNeedsActionSection_APIUnreachable(t *testing.T) {
-	section := renderNeedsActionSection([]Task{{Path: "x.md", Title: "x", Status: "triage"}}, true, nil)
+	section := renderNeedsActionSection([]Task{{Path: "x.md", Title: "x", Status: "triage"}}, true, nil, nil)
 	if !strings.Contains(section, "_TaskNotes API unreachable._") {
 		t.Errorf("expected unreachable fallback, got:\n%s", section)
 	}

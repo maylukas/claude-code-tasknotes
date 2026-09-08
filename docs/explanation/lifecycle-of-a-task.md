@@ -44,6 +44,8 @@ For work with an associated GitLab merge request (`customProperties.mr`), a back
 - **Closed without merge**: a `review` task reopens to `in-progress`; a `needs-input`/`triage` task is likewise left alone, with a note recording the close. Either way, the task's owner (or a fallback agent, or the queue) gets an informational message to go investigate.
 - `/status.needsActionTasks[].mrState` (and the dashboard's Needs-your-action section) surfaces the watcher's last-observed state, so a needs-input task with an already-merged MR is visibly distinct from one still waiting on the pipeline.
 
+While an MR sits `"opened"`, the same pass also checks its GitLab review discussions. A new comment from anyone other than the MR's own author (never the acting agent's own reply) gets a bridge-attributed note on the task summarizing who commented, how many discussion threads are still unresolved, and an excerpt of the earliest new comment, plus a message to the task's owner (or the project's fallback agent/queue, the same routing `transitionMRClosed` uses) telling it to address the feedback, push, then reply/resolve on GitLab. A thread resolving with no accompanying new comment just updates the tracked open-thread count silently. `/status.needsActionTasks[].mrOpenThreads` (and the matching field on an agent's own `ownedTasks`) surfaces that count, and the dashboard's Needs-your-action MR line appends `, N unresolved thread(s)` when it's nonzero.
+
 A task's dependents don't wait for the next 10-minute scan: the moment a task transitions to `done`, an unblock pass queries for open, dependency-bearing tasks that are now startable and routes an assignment for each, suffixed `[unblocked by <completed title>]`.
 
 ## 8. Closing the task

@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.7.1"
+const daemonVersion = "0.8.0"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -304,6 +304,14 @@ type State struct {
 	// see permissionDenialRecord's doc comment. Keyed by
 	// "<agentName>|<toolName>|<CommandSummary>".
 	PermissionDenials map[string]*permissionDenialRecord `json:"permissionDenials"`
+	// MRReviews maps a task's path to its last-observed GitLab MR
+	// review-comment state (see mrReviewState/checkTaskMRReviews) — the
+	// review-comment sibling of MRStates: MRStates tracks the MR's overall
+	// state (opened/merged/closed), this tracks reviewer thread activity
+	// WITHIN an open MR. A task's first-ever observation seeds this without
+	// notifying, same migration-style dedup convention as MRStates and the
+	// other maps in this struct.
+	MRReviews map[string]mrReviewState `json:"mrReviews"`
 }
 
 // workerEntry is one declared worker subtask under an owning agent.

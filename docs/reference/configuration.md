@@ -163,6 +163,7 @@ Both keys, and the whole file, may be omitted. Settings are cached for **60 seco
 | `TN_ENABLE_ORPHAN_SWEEP` | `"1"` enables the orphaned-agent-death sweep. Off by default after a confirmed false positive (a live agent was once wrongly declared dead). |
 | `TN_NO_SCANNER` | `"1"` disables the due-task scanner. |
 | `TN_NO_MRWATCH` | `"1"` disables the MR-state watcher. |
+| `TN_NO_MRCOMMENTS` | `"1"` disables the MR watcher's review-comment discussions fetch (state left untouched) while leaving MR-state watching (merge/close detection) itself on. |
 | `TN_NO_REPAIR` | `"1"` disables all three startup cleanup passes (poisoned-dedup-state repair, orphaned-ownership-debt sweep, stranded-message sweep). One variable gates all three. |
 | `TN_NO_RECONCILER` | `"1"` disables the spawn reconciler. |
 | `TN_NO_STUCKCHECK` | `"1"` disables stuck-session *detection* entirely (not just the popup; see `TN_NO_DIALOG` for that narrower knob). |
@@ -199,7 +200,7 @@ These are set by the daemon into the environment of a process it spawns; they're
 
 > **Note:** `ORCHESTRATOR.md` (the operating contract read by daemon-spawned sessions) is located at startup, in this order: the `TN_ORCHESTRATOR_DOC` environment variable, `serve.json`'s `orchestratorDoc` key, `~/.config/tn/ORCHESTRATOR.md`, `ORCHESTRATOR.md` next to the `tn` binary, then `./ORCHESTRATOR.md` in the daemon's working directory. The first existing file wins; the daemon logs `serve: orchestrator contract: <path>` at startup, or a warning naming the two ways to set it when none is found. Copy the file from this repository to `~/.config/tn/` or point `orchestratorDoc` at your checkout.
 
-> **Note:** the MR watcher (`TN_NO_MRWATCH` above) invokes the `glab` CLI, resolved from `/opt/homebrew/bin/glab`, `/usr/local/bin/glab`, `/usr/bin/glab`, then `glab` on `$PATH`.
+> **Note:** the MR watcher (`TN_NO_MRWATCH` above) invokes the `glab` CLI, resolved from `/opt/homebrew/bin/glab`, `/usr/local/bin/glab`, `/usr/bin/glab`, then `glab` on `$PATH`. Its review-comment sub-pass (`TN_NO_MRCOMMENTS` above) makes two further `glab api` calls per open MR-bearing task — one for the MR resource itself (to learn its author, so the watcher never reacts to the agent's own comments) and one for its discussions — only for a task whose MR is currently `"opened"`.
 
 The LaunchAgent plist (macOS service supervisor) is not written by `tn`. It's a user-created file. Logs (for example `~/Library/Logs/tn-serve.log`) exist only if something external redirects the daemon's stdout/stderr to a file. `tn serve` itself never opens or writes a log file; it only calls Go's standard `log` package, which goes to stderr by default. See [../how-to/run-as-a-service.md](../how-to/run-as-a-service.md) for a working LaunchAgent example.
 

@@ -210,6 +210,25 @@ type Server struct {
 	// succeeds again.
 	mrWatchWarnedOnce map[string]bool
 
+	// mrReviewsWarnedOnce is mrWatchWarnedOnce's sibling for the
+	// review-comment discussions fetch (see checkTaskMRReviews) — a
+	// separate map, not a shared one with a key suffix, since the two
+	// fetches (MR state vs. discussions) fail independently and a warning
+	// for one must not suppress a warning for the other.
+	mrReviewsWarnedOnce map[string]bool
+
+	// mrDiscussionsFunc resolves review-comment discussions for the MR
+	// watcher's checkMRStatesOnce pass (see mrDiscussionsFunc's own doc
+	// comment in mr_watcher.go). Nil by default — most existing tests
+	// predate the review-comment feature and never set it, and
+	// checkMRStatesOnce treats nil as "review watching not wired up this
+	// pass" rather than calling a nil function, so none of them needed to
+	// change when this field was added. Set once by startMRWatcher (to
+	// glabMRDiscussions) before its ticker goroutine begins; a test that
+	// DOES exercise review comments assigns a fake directly, same
+	// no-lock-needed convention as tnClient.
+	mrDiscussionsFunc mrDiscussionsFunc
+
 	dashboardPath    string
 	dashboardDeb     *debouncer
 	lastDashboardErr string
@@ -298,20 +317,21 @@ type Server struct {
 
 func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string) error) *Server {
 	s := &Server{
-		state:              loadState(statePath),
-		statePath:          statePath,
-		config:             cfg,
-		spawnFunc:          spawnFunc,
-		notify:             make(chan struct{}),
-		dashboardPath:      cfg.DashboardPath,
-		sessionPagesDir:    cfg.SessionPagesDir,
-		stuck:              newStuckTracker(),
-		sse:                newSSEHub(),
-		mrWatchWarnedOnce:  map[string]bool{},
-		repoSettings:       newRepoSettingsCache(),
-		startedAt:          time.Now(),
-		seenSinceStart:     map[string]bool{},
-		approveRescanDelay: defaultApproveRescanDelay,
+		state:               loadState(statePath),
+		statePath:           statePath,
+		config:              cfg,
+		spawnFunc:           spawnFunc,
+		notify:              make(chan struct{}),
+		dashboardPath:       cfg.DashboardPath,
+		sessionPagesDir:     cfg.SessionPagesDir,
+		stuck:               newStuckTracker(),
+		sse:                 newSSEHub(),
+		mrWatchWarnedOnce:   map[string]bool{},
+		mrReviewsWarnedOnce: map[string]bool{},
+		repoSettings:        newRepoSettingsCache(),
+		startedAt:           time.Now(),
+		seenSinceStart:      map[string]bool{},
+		approveRescanDelay:  defaultApproveRescanDelay,
 	}
 	if s.dashboardPath != "" {
 		s.dashboardDeb = newDebouncer(dashboardDebounceInterval, s.renderDashboard)

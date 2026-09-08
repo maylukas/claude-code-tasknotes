@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -118,6 +119,299 @@ func glabMRState(mrURL string) (string, error) {
 	return resp.State, nil
 }
 
+// --- MR review-comment watching ---
+
+// mrNote is one note (comment) within a GitLab MR discussion thread, as
+// returned by GET /projects/:id/merge_requests/:iid/discussions. Parsed
+// defensively — a missing/unexpected field just yields its zero value,
+// never an error, since a discussions payload is expected to vary (a
+// diff-note carries position data this watcher doesn't need at all, a
+// system note carries no useful Author for our purposes, etc).
+type mrNote struct {
+	ID         int
+	Author     string
+	Body       string
+	System     bool
+	Resolvable bool
+	Resolved   bool
+	CreatedAt  time.Time
+}
+
+// mrDiscussions is one MR's review-comment state as fetched by
+// mrDiscussionsFunc: its author (an MR watcher note authored by the same
+// user as the MR itself is presumed to be the acting agent posting on the
+// user's behalf — e.g. replying to its own thread — and never counts as
+// new reviewer activity) plus every discussion thread, each thread an
+// ordered slice of notes exactly as GitLab returns them.
+type mrDiscussions struct {
+	MRAuthor string
+	Threads  [][]mrNote
+}
+
+// mrDiscussionsFunc resolves a GitLab MR URL to its discussion threads,
+// injectable (like mrStateFunc) so tests never exec glab.
+type mrDiscussionsFunc func(mrURL string) (mrDiscussions, error)
+
+// mrReviewState is State.MRReviews' per-task value: enough to detect new
+// reviewer activity and a change in open-thread count on the next pass
+// without re-deriving it from scratch. See checkTaskMRReviews.
+type mrReviewState struct {
+	// LastNoteID is the highest note ID observed across every thread as of
+	// the last pass (system notes and the MR author's own notes included —
+	// this is a high-water mark over ALL note IDs, not just reviewer ones,
+	// so a note ID space that isn't strictly increasing per-thread still
+	// bounds "new" correctly).
+	LastNoteID int `json:"lastNoteId"`
+	// OpenThreads is the count of discussion threads whose first resolvable
+	// note is unresolved, as of the last pass.
+	OpenThreads int `json:"openThreads"`
+	// LastNotifiedAt is when a reviewer-comment notification was last sent
+	// for this task (zero value: never, including the silent first-seed).
+	LastNotifiedAt time.Time `json:"lastNotifiedAt,omitempty"`
+}
+
+// mrDiscussionsAPIPath and mrResourceAPIPath build glab's "api" subcommand
+// path for an MR's discussions / the MR resource itself, from mrURL —
+// factored out from glabMRDiscussions so the URL-building and project-path
+// escaping is directly unit-testable without exec'ing glab. per_page=100
+// bounds the discussions fetch to a first-page snapshot (a GitLab MR with
+// more than 100 discussion THREADS, not notes, in flight is vanishingly
+// rare, and the watcher only needs a bounded per-pass read, not exhaustive
+// pagination).
+func mrDiscussionsAPIPath(mrURL string) (string, error) {
+	project, iid, ok := parseMRURL(mrURL)
+	if !ok {
+		return "", fmt.Errorf("unparseable MR URL: %s", mrURL)
+	}
+	return fmt.Sprintf("projects/%s/merge_requests/%s/discussions?per_page=100", url.PathEscape(project), iid), nil
+}
+
+func mrResourceAPIPath(mrURL string) (string, error) {
+	project, iid, ok := parseMRURL(mrURL)
+	if !ok {
+		return "", fmt.Errorf("unparseable MR URL: %s", mrURL)
+	}
+	return fmt.Sprintf("projects/%s/merge_requests/%s", url.PathEscape(project), iid), nil
+}
+
+// runGlabAPI shells out to `glab api <path>` and decodes the JSON response
+// into out. Same HOME/env handling as glabMRState, for the same launchd
+// reason.
+func runGlabAPI(path string, out any) error {
+	cmd := exec.Command(resolveGlabBin(), "api", path)
+	cmd.Env = os.Environ()
+	if home, err := os.UserHomeDir(); err == nil {
+		cmd.Env = append(cmd.Env, "HOME="+home)
+	}
+	b, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
+
+// glabMRDiscussions is mrDiscussionsFunc's real implementation. It makes
+// TWO glab calls: one for the MR resource itself (to learn its author's
+// username) and one for its discussions. This — rather than extending
+// glabMRState's JSON parsing to also capture author.username, the other
+// option raised when this was designed — was chosen because mrStateFunc's
+// (string, error) signature is used pervasively (checkTaskMRState and
+// every existing MR-watcher test): widening it to also return an author
+// would ripple through all of them for a value only the review-comment
+// path needs. An isolated second call keeps that blast radius to this one
+// function.
+func glabMRDiscussions(mrURL string) (mrDiscussions, error) {
+	discPath, err := mrDiscussionsAPIPath(mrURL)
+	if err != nil {
+		return mrDiscussions{}, err
+	}
+	resourcePath, err := mrResourceAPIPath(mrURL)
+	if err != nil {
+		return mrDiscussions{}, err
+	}
+
+	var resource struct {
+		Author struct {
+			Username string `json:"username"`
+		} `json:"author"`
+	}
+	if err := runGlabAPI(resourcePath, &resource); err != nil {
+		return mrDiscussions{}, err
+	}
+
+	var raw []struct {
+		Notes []struct {
+			ID         int    `json:"id"`
+			Body       string `json:"body"`
+			System     bool   `json:"system"`
+			Resolvable bool   `json:"resolvable"`
+			Resolved   bool   `json:"resolved"`
+			Author     struct {
+				Username string `json:"username"`
+			} `json:"author"`
+			CreatedAt string `json:"created_at"`
+		} `json:"notes"`
+	}
+	if err := runGlabAPI(discPath, &raw); err != nil {
+		return mrDiscussions{}, err
+	}
+
+	out := mrDiscussions{MRAuthor: resource.Author.Username}
+	for _, d := range raw {
+		thread := make([]mrNote, 0, len(d.Notes))
+		for _, n := range d.Notes {
+			created, _ := time.Parse(time.RFC3339, n.CreatedAt) // zero value on parse failure — never fatal
+			thread = append(thread, mrNote{
+				ID: n.ID, Author: n.Author.Username, Body: n.Body,
+				System: n.System, Resolvable: n.Resolvable, Resolved: n.Resolved,
+				CreatedAt: created,
+			})
+		}
+		out.Threads = append(out.Threads, thread)
+	}
+	return out, nil
+}
+
+// collapseWhitespace joins s's whitespace-separated fields with a single
+// space each — used to fold a (possibly multi-line) note body into one
+// readable line for a bridge note / message.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// checkTaskMRReviews checks t's MR for new reviewer comments and a change
+// in open-thread count, called by checkMRStatesOnce ONLY for a task whose
+// MR state this pass observed as "opened" (merged/closed MRs don't need
+// review-thread tracking — the MR itself is no longer actionable). Mirrors
+// checkTaskMRState's seed-then-observe-changes shape: a task's first-ever
+// observation seeds State.MRReviews silently (no note, no message — avoids
+// a notification storm the moment this feature ships against every
+// already-open MR), and a failed discussions fetch never mutates
+// MRReviews, logged once per task per outage via mrReviewsWarnedOnce, so a
+// later successful pass picks up cleanly from the last confirmed state —
+// same contract as checkTaskMRState's glab-error handling.
+func (s *Server) checkTaskMRReviews(client *Client, discussions mrDiscussionsFunc, t Task, mrURL string) {
+	if os.Getenv("TN_NO_MRCOMMENTS") == "1" {
+		return
+	}
+
+	disc, err := discussions(mrURL)
+	if err != nil {
+		s.mu.Lock()
+		alreadyWarned := s.mrReviewsWarnedOnce[t.Path]
+		s.mrReviewsWarnedOnce[t.Path] = true
+		s.mu.Unlock()
+		if !alreadyWarned {
+			log.Printf("serve: mr watcher: failed to resolve MR discussions for %s (%s): %v", t.Path, mrURL, err)
+		}
+		return
+	}
+	s.mu.Lock()
+	s.mrReviewsWarnedOnce[t.Path] = false
+	s.mu.Unlock()
+
+	// openThreads: a thread counts as open when its first resolvable note
+	// (in thread order) is unresolved; a thread with no resolvable note at
+	// all never counts as open. candidateNotes collects every non-system
+	// note NOT authored by the MR author, across every thread, in API
+	// order — the eventual "new" set is this filtered by note ID against
+	// the previously-recorded high-water mark.
+	openThreads := 0
+	maxNoteID := 0
+	var candidateNotes []mrNote
+	for _, thread := range disc.Threads {
+		var firstResolvable *mrNote
+		for i := range thread {
+			n := &thread[i]
+			if n.ID > maxNoteID {
+				maxNoteID = n.ID
+			}
+			if firstResolvable == nil && n.Resolvable {
+				firstResolvable = n
+			}
+			if !n.System && n.Author != disc.MRAuthor {
+				candidateNotes = append(candidateNotes, *n)
+			}
+		}
+		if firstResolvable != nil && !firstResolvable.Resolved {
+			openThreads++
+		}
+	}
+
+	s.mu.Lock()
+	prev, seen := s.state.MRReviews[t.Path]
+	s.mu.Unlock()
+
+	if !seen {
+		s.mu.Lock()
+		if s.state.MRReviews == nil {
+			s.state.MRReviews = map[string]mrReviewState{}
+		}
+		s.state.MRReviews[t.Path] = mrReviewState{LastNoteID: maxNoteID, OpenThreads: openThreads}
+		s.saveLocked()
+		s.mu.Unlock()
+		log.Printf("serve: mr watcher: seeded review state for %s (%d open thread(s))", t.Path, openThreads)
+		return
+	}
+
+	var newNotes []mrNote
+	for _, n := range candidateNotes {
+		if n.ID > prev.LastNoteID {
+			newNotes = append(newNotes, n)
+		}
+	}
+
+	if len(newNotes) == 0 {
+		// Threads may still have resolved/reopened with no NEW note driving
+		// it (e.g. resolving via the "Resolve thread" button posts no
+		// note), and the high-water mark itself may have advanced from a
+		// system/MR-author note that never counts as "new" — persist both
+		// unconditionally, same "always record what was actually observed"
+		// convention as checkTaskMRState; only the note/message/activity
+		// below is gated on genuine new reviewer activity.
+		s.mu.Lock()
+		s.state.MRReviews[t.Path] = mrReviewState{LastNoteID: maxNoteID, OpenThreads: openThreads, LastNotifiedAt: prev.LastNotifiedAt}
+		s.saveLocked()
+		s.mu.Unlock()
+		return
+	}
+
+	sort.Slice(newNotes, func(i, j int) bool { return newNotes[i].ID < newNotes[j].ID })
+
+	seenAuthor := map[string]bool{}
+	var authors []string
+	for _, n := range newNotes {
+		if n.Author != "" && !seenAuthor[n.Author] {
+			seenAuthor[n.Author] = true
+			authors = append(authors, n.Author)
+		}
+	}
+	firstBody := truncate(collapseWhitespace(newNotes[0].Body), 140)
+
+	noteText := fmt.Sprintf("Review comments on MR (%s): %d new by %s, %d unresolved thread(s). First: %q",
+		mrURL, len(newNotes), strings.Join(authors, ", "), openThreads, firstBody)
+	if _, err := bridgeNoteTask(client, t.Path, noteText); err != nil {
+		log.Printf("serve: mr watcher: failed to note review comments for %s: %v", t.Path, err)
+		return
+	}
+
+	if project := routingSlugForTask(t); project != "" {
+		s.dispatchMessage(sendRequest{
+			Project:  project,
+			TaskPath: t.Path,
+			Text: fmt.Sprintf("Review comments on MR %s for %s (%s): %d new, %d unresolved thread(s). Address them, push, then reply/resolve on GitLab.",
+				mrURL, t.Title, t.Path, len(newNotes), openThreads),
+		})
+	}
+
+	s.mu.Lock()
+	s.appendActivityLocked("bridge", fmt.Sprintf("Review comments on %s: %d new (%s)", t.Path, len(newNotes), mrURL), t.Path)
+	s.state.MRReviews[t.Path] = mrReviewState{LastNoteID: maxNoteID, OpenThreads: openThreads, LastNotifiedAt: time.Now()}
+	s.saveLocked()
+	s.mu.Unlock()
+	s.triggerRenders()
+}
+
 // startMRWatcher launches a background goroutine that checks GitLab MR
 // state for every non-completed task with a customProperties.mr URL set,
 // transitioning the task's status on an OBSERVED state change (see
@@ -127,6 +421,10 @@ func (s *Server) startMRWatcher(client *Client) {
 	if os.Getenv("TN_NO_MRWATCH") == "1" {
 		return
 	}
+	// Set once, before the ticker goroutine is spawned below — the `go`
+	// statement itself is a happens-before edge (Go memory model), so no
+	// separate synchronization is needed for the goroutine's later reads.
+	s.mrDiscussionsFunc = glabMRDiscussions
 	go func() {
 		time.Sleep(mrWatchInitialDelay)
 		s.checkMRStatesOnce(client, glabMRState)
@@ -167,6 +465,20 @@ func (s *Server) checkMRStatesOnce(client *Client, mrState mrStateFunc) {
 			continue
 		}
 		s.checkTaskMRState(client, mrState, t, mrURL)
+
+		// Review-comment watching only makes sense for an MR that's still
+		// open — merged/closed MRs don't need thread tracking. s.mrDiscussionsFunc
+		// is nil for most existing tests (which predate this feature and
+		// never set it, same convention as s.tnClient) — treated as "review
+		// watching not wired up this pass" rather than a nil-func call.
+		if s.mrDiscussionsFunc != nil {
+			s.mu.Lock()
+			state := s.state.MRStates[t.Path]
+			s.mu.Unlock()
+			if state == "opened" {
+				s.checkTaskMRReviews(client, s.mrDiscussionsFunc, t, mrURL)
+			}
+		}
 	}
 }
 

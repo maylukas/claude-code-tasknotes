@@ -262,6 +262,12 @@ type statusOwnedTask struct {
 	Path   string `json:"path"`
 	Title  string `json:"title,omitempty"`
 	Status string `json:"status,omitempty"`
+	// MROpenThreads mirrors statusNeedsActionTask.MROpenThreads — an
+	// in-progress task an agent owns shows its unresolved review-thread
+	// count right on the agent's own page, not only in needsActionTasks
+	// (which an owned in-progress task, as opposed to review/needs-input/
+	// triage, doesn't even appear in).
+	MROpenThreads int `json:"mrOpenThreads,omitempty"`
 }
 
 // statusWorker is one entry in statusAgent.Workers.
@@ -324,6 +330,12 @@ type statusNeedsActionTask struct {
 	// tell a task whose MR merged apart from one still open, instead of
 	// showing only the bare mr URL.
 	MRState string `json:"mrState,omitempty"`
+	// MROpenThreads is the MR watcher's last-observed count of unresolved
+	// review-discussion threads for this task's MR (see State.MRReviews /
+	// checkTaskMRReviews) — 0/omitted if the task has no mr set, hasn't
+	// been observed by the review-comment watcher yet, or genuinely has no
+	// unresolved threads.
+	MROpenThreads int `json:"mrOpenThreads,omitempty"`
 }
 
 type statusStuckPrompt struct {
@@ -554,7 +566,7 @@ func buildStatusResponse(
 			ownedTasks = make([]statusOwnedTask, 0, len(paths))
 			for _, path := range paths {
 				ts := taskSummaryByPath[path] // zero value (empty Title/Status) if evicted/stale — see statusAgent.OwnedTasks doc
-				ownedTasks = append(ownedTasks, statusOwnedTask{Path: path, Title: ts.Title, Status: ts.Status})
+				ownedTasks = append(ownedTasks, statusOwnedTask{Path: path, Title: ts.Title, Status: ts.Status, MROpenThreads: snap.MRReviews[path].OpenThreads})
 			}
 		} else {
 			historicalOwned = len(paths)
@@ -641,7 +653,7 @@ func buildStatusResponse(
 			Title: t.Title, Path: t.Path, Status: t.Status, Project: proj, MR: t.CustomProperties["mr"],
 			IntegrationBranch: integrationBranchFor(t), IntegrationRole: integrationRoleFor(t),
 			Jira: t.CustomProperties["jira"], JiraNC: t.CustomProperties["jira-nc"],
-			Ask: ab.Ask, Brief: ab.Brief, MRState: snap.MRStates[t.Path],
+			Ask: ab.Ask, Brief: ab.Brief, MRState: snap.MRStates[t.Path], MROpenThreads: snap.MRReviews[t.Path].OpenThreads,
 		})
 	}
 

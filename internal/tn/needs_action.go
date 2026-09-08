@@ -90,8 +90,10 @@ var needsActionGroups = []struct{ status, emoji, label string }{
 // subheader per non-empty group. Each line links the task and, if present,
 // its first project. apiErr renders a one-line unreachable fallback instead
 // (the section is never omitted outright, so its position at the top of the
-// note stays stable across renders).
-func renderNeedsActionSection(tasks []Task, apiErr bool, mrStates map[string]string) string {
+// note stays stable across renders). mrOpenThreads (taskPath -> unresolved
+// review-thread count) appends ", N unresolved thread(s)" right after the
+// MR state annotation when N > 0 — see checkTaskMRReviews.
+func renderNeedsActionSection(tasks []Task, apiErr bool, mrStates map[string]string, mrOpenThreads map[string]int) string {
 	var b strings.Builder
 	b.WriteString("## Needs your action\n\n")
 
@@ -115,6 +117,9 @@ func renderNeedsActionSection(tasks []Task, apiErr bool, mrStates map[string]str
 				line += fmt.Sprintf(" — [MR](%s)", mr)
 				if state := mrStates[t.Path]; state != "" {
 					line += fmt.Sprintf(" (%s)", state)
+				}
+				if n := mrOpenThreads[t.Path]; n > 0 {
+					line += fmt.Sprintf(", %d unresolved thread(s)", n)
 				}
 			}
 			if branch := integrationBranchFor(t); branch != "" {

@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Added
 
+- MR watcher now also tracks GitLab review-comment threads on an open MR: a new reviewer comment (never the acting agent's own) appends a note to the task and messages its owner, and `/status.needsActionTasks[].mrOpenThreads` (also surfaced on an agent's `ownedTasks`) reports the unresolved-thread count. `TN_NO_MRCOMMENTS=1` disables just this sub-pass.
+
 ### Changed
 
 - Repository restructured into `cmd/tn` (entrypoint) and `internal/tn` (all packages), with `serve.go` split by topic and the web UI bundle embedded from `webui/embed.go`; design documents moved to `docs/design/`. Build with `go build ./cmd/tn`.

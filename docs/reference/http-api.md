@@ -654,7 +654,7 @@ The full daemon state snapshot: the source for the tray app, the embedded web UI
           "tmuxSession": "tn-myapp-g3",
           "lastSeenAt": "2026-09-02T10:05:00Z",
           "ownedInProgress": 2,
-          "ownedTasks": [{"path": "tasks/fix-login-bug.md", "title": "Fix login bug", "status": "in-progress"}],
+          "ownedTasks": [{"path": "tasks/fix-login-bug.md", "title": "Fix login bug", "status": "in-progress", "mrOpenThreads": 2}],
           "historicalOwned": 0,
           "workers": [{"path": "tasks/write-tests.md", "title": "Write tests", "status": "in-progress", "startedAt": "2026-09-02T10:01:00Z"}]
         }
@@ -681,7 +681,8 @@ The full daemon state snapshot: the source for the tray app, the embedded web UI
       "jiraNc": "",
       "ask": "Which environment should this ship to first?",
       "brief": "",
-      "mrState": ""
+      "mrState": "",
+      "mrOpenThreads": 0
     }
   ],
   "stuckPrompts": [{"agent": "orchestrator-myapp-g3", "tmuxSession": "tn-myapp-g3", "excerpt": "Do you want to proceed? ..."}],
@@ -709,6 +710,7 @@ Key fields worth calling out explicitly:
 | `projects.<slug>.agents[].historicalOwned` | Set only for a non-alive agent: the same ownership count, kept visible under a name that makes clear it's not current work (so a generation retired days ago doesn't read as "currently carrying" tasks it touched once). |
 | `projects.<slug>.agents[].workers` | Worker subtasks this agent has declared via `POST /workers/start` and not yet ended. |
 | `needsActionTasks[].mrState` | The MR watcher's last-observed GitLab MR state for this task's `mr` — `"opened"`/`"merged"`/`"closed"`, or `""` if the task has no `mr` set or hasn't been observed yet. The watcher polls every non-completed task, not just `review`, so a `needs-input`/`triage` task whose MR already merged shows `mrState: "merged"` here (and gets a note on the task) instead of being silently ignored — it's never auto-closed, since the status may be parked for a reason unrelated to the MR. |
+| `needsActionTasks[].mrOpenThreads` / `projects.<slug>.agents[].ownedTasks[].mrOpenThreads` | The MR watcher's last-observed count of unresolved GitLab review-discussion threads for this task's `mr`, only tracked while the MR's `mrState` is `"opened"`. `0`/omitted if the task has no `mr` set, hasn't been observed by the review-comment watcher yet, or genuinely has no unresolved threads. A new reviewer comment (not the MR author's own) also appends a note to the task and messages its owner — see [`docs/explanation/lifecycle-of-a-task.md`](../explanation/lifecycle-of-a-task.md), "Review, merge, and the MR watcher". |
 
 **Notes:** Spectator-safe by construction: building this response never marks a message delivered and never bumps any agent's `lastSeenAt`. Agent names under the internal test-verification prefix (`zz-`) are excluded from every project's agent list here, even though they remain in the underlying registry, so ad hoc verification agents never appear as real generations in the UI. `stuckPrompts` is not capped: it lists every agent currently tracked as stuck, across all projects, however many that is. `triage` is a deliberately passive signal (count and the single longest-waiting task), not an alert, added after triage tasks sat unpicked-up for hours while nothing surfaced that fact to a human; it does not decide anything is wrong, only how long the oldest one has been waiting. `permissionDenials` is the same kind of passive telemetry, not a decision.
 

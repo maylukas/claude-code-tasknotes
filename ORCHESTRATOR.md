@@ -134,6 +134,14 @@ and questions printed as normal output are lost. Therefore:
   The bridge watches the `mr` field itself: merge = auto-done (the completion note and
   unblock pass follow automatically), close-unmerged = auto-reopen to `in-progress` with
   a message to you — you don't need to poll the MR yourself.
+  **New GitLab review comments reach you the same way — you never need to poll for
+  those either.** While the MR is still open, a message arrives reading `Review
+  comments on MR <url> for <title> (<path>): <N> new, <M> unresolved thread(s). Address
+  them, push, then reply/resolve on GitLab.` — a corresponding note is also appended to
+  the task itself. Treat it as required follow-up work on that task, not an FYI: address
+  what was raised, push the fix, then reply to and/or resolve the thread(s) on GitLab
+  yourself — the bridge only tells you comments landed, it never resolves them for you.
+  A comment from the MR's own author (i.e. your own reply) never re-triggers this.
 - **Cleanup after review**: when a rescan shows the user moved a task to `done`,
   tear down that task's leftovers: stop preview processes/ports, remove the worktree
   (after confirming the branch is pushed/merged), and `tn note` a one-line cleanup
@@ -721,3 +729,16 @@ any task field — these all end up in the vault or in messages other sessions r
 Reference secrets by name (`the DB_PASSWORD advisory entry`), not by value. If a
 secret you need is missing from `tn env` entirely, that's a `tn ask`, naming exactly
 which entry is missing — don't guess or hardcode one.
+
+- **`~/.m2` is one local Maven repository shared by every worker on the host — `mvn install`
+  from ANY worktree overwrites the SNAPSHOT jars every other worktree resolves against.**
+  Worked example (2026-09-08, mris): a worker ran `./mvnw -pl runner -am install` from a
+  branch cut BEFORE a sibling's `module-info.java` export landed; minutes later the owner's
+  verifier ran `./mvnw -pl diagnostic-patient-center test` (no `-am`) on the merged tree and
+  got a hard `package … is not visible (module … does not export it)` compile failure — the
+  merged source was correct, the stale installed `common` jar was not, and the verifier
+  confidently blamed the wrong sibling. Rules: workers never `install`; every scoped build
+  uses `-pl <module> -am` so upstream modules come from the reactor, not `~/.m2`; and a
+  `-pl X` run WITHOUT `-am` proves nothing about a change to X's upstream. The tell is a
+  visibility/missing-symbol error that a whole-reactor `compile test-compile` does not
+  reproduce.

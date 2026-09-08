@@ -126,6 +126,7 @@ func loadState(path string) *State {
 		Workers:             map[string][]workerEntry{},
 		DoneMeansNoted:      map[string]bool{},
 		PermissionDenials:   map[string]*permissionDenialRecord{},
+		MRReviews:           map[string]mrReviewState{},
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -175,6 +176,9 @@ func loadState(path string) *State {
 	}
 	if st.PermissionDenials == nil {
 		st.PermissionDenials = map[string]*permissionDenialRecord{}
+	}
+	if st.MRReviews == nil {
+		st.MRReviews = map[string]mrReviewState{}
 	}
 	return st
 }

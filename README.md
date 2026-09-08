@@ -118,7 +118,7 @@ Full key-by-key reference: [`docs/reference/configuration.md`](docs/reference/co
 
 ## Features
 
-- Full task CRUD against the TaskNotes HTTP API, including dependencies, Jira linkage, and MR tracking: [`docs/reference/cli.md`](docs/reference/cli.md)
+- Full task CRUD against the TaskNotes HTTP API, including dependencies, Jira linkage, and MR tracking (state changes and reviewer comments): [`docs/reference/cli.md`](docs/reference/cli.md)
 - A structured, foldable task-note body (ask / brief / description / history) instead of a flat log: [`docs/reference/note-layout.md`](docs/reference/note-layout.md)
 - A local bridge daemon (`tn serve`) with an agent registry, message bus, and webhook routing: [`docs/reference/http-api.md`](docs/reference/http-api.md)
 - Automatic orchestrator spawning in tmux, with generation-based rolling replacement instead of hard rotation: [`docs/explanation/generations-and-drain.md`](docs/explanation/generations-and-drain.md)
