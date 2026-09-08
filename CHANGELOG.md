@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Fixed
 
+- MR watcher now polls every non-completed task with an `mr` field; a merged MR on a `needs-input` or `triage` task is noted on the task and shown as `mrState` in `/status.needsActionTasks` instead of being ignored (and is not auto-closed).
+
 ## [0.7.0] - 2026-09-08
 
 First public snapshot.

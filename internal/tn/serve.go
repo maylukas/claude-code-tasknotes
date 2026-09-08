@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.7.0"
+const daemonVersion = "0.7.1"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.

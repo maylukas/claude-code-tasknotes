@@ -317,6 +317,13 @@ type statusNeedsActionTask struct {
 	// one with no ask/brief set.
 	Ask   string `json:"ask,omitempty"`
 	Brief string `json:"brief,omitempty"`
+	// MRState is the MR watcher's last-observed GitLab MR state for this
+	// task (see State.MRStates / dashboardSnapshot.MRStates) —
+	// "opened"/"merged"/"closed", or "" if the task has no mr set or
+	// hasn't been observed by the watcher yet. Lets the dashboard/webui
+	// tell a task whose MR merged apart from one still open, instead of
+	// showing only the bare mr URL.
+	MRState string `json:"mrState,omitempty"`
 }
 
 type statusStuckPrompt struct {
@@ -634,7 +641,7 @@ func buildStatusResponse(
 			Title: t.Title, Path: t.Path, Status: t.Status, Project: proj, MR: t.CustomProperties["mr"],
 			IntegrationBranch: integrationBranchFor(t), IntegrationRole: integrationRoleFor(t),
 			Jira: t.CustomProperties["jira"], JiraNC: t.CustomProperties["jira-nc"],
-			Ask: ab.Ask, Brief: ab.Brief,
+			Ask: ab.Ask, Brief: ab.Brief, MRState: snap.MRStates[t.Path],
 		})
 	}
 

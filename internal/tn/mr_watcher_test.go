@@ -40,12 +40,45 @@ func TestParseMRURL(t *testing.T) {
 	}
 }
 
+// TestBuildMRWatchQuery_PollsAllNonCompletedTasks verifies the query shape
+// widened away from the old review/in-progress/open status-OR group: no
+// status filter at all, just archived is-not-checked plus a
+// status.isCompleted is-not-checked condition — so a task parked in
+// needs-input or triage keeps being polled instead of falling out of the
+// watcher's view forever.
+func TestBuildMRWatchQuery_PollsAllNonCompletedTasks(t *testing.T) {
+	fn := buildMRWatchQuery()
+	if fn.Type != "group" || fn.ID != "root" || fn.Conjunction != "and" {
+		t.Fatalf("unexpected root shape: %+v", fn)
+	}
+	want := []filterNode{
+		{Type: "condition", ID: "archived", Property: "archived", Operator: "is-not-checked"},
+		{Type: "condition", ID: "mr-watch-not-completed", Property: "status.isCompleted", Operator: "is-not-checked"},
+	}
+	if len(fn.Children) != len(want) {
+		t.Fatalf("expected %d conditions (no status-OR group), got %d: %+v", len(want), len(fn.Children), fn.Children)
+	}
+	for i, w := range want {
+		if fn.Children[i].Type != w.Type || fn.Children[i].ID != w.ID || fn.Children[i].Property != w.Property || fn.Children[i].Operator != w.Operator {
+			t.Errorf("condition %d: got %+v, want %+v", i, fn.Children[i], w)
+		}
+	}
+	for _, c := range fn.Children {
+		if c.Property == "status" {
+			t.Errorf("expected no bare status condition/OR-group, found one: %+v", fn.Children)
+		}
+	}
+	if fn.SortKey != "dateModified" || fn.SortDirection != "desc" {
+		t.Errorf("expected sort unchanged (dateModified desc), got %q/%q", fn.SortKey, fn.SortDirection)
+	}
+}
+
 // fakeMRWatcherAPI simulates the TaskNotes API surface the MR watcher
 // touches: POST /api/tasks/query (routes to mrWatchTasks or
 // unblockPassTasks depending on which query shape it recognizes — the
-// MR-watch query's status-OR group always includes an "s-in-progress"
-// condition ID, which the unblock-pass query never has), GET
-// /api/tasks/:id, and PUT /api/tasks/:id (captured for assertions).
+// MR-watch query always includes an "mr-watch-not-completed" condition ID,
+// which the unblock-pass query never has), GET /api/tasks/:id, and PUT
+// /api/tasks/:id (captured for assertions).
 func fakeMRWatcherAPI(t *testing.T, mrWatchTasks, unblockPassTasks []Task, detailsByPath map[string]Task) (*httptest.Server, *[]map[string]any) {
 	t.Helper()
 	var mu sync.Mutex
@@ -57,7 +90,7 @@ func fakeMRWatcherAPI(t *testing.T, mrWatchTasks, unblockPassTasks []Task, detai
 		case r.Method == http.MethodPost && r.URL.Path == "/api/tasks/query":
 			body, _ := io.ReadAll(r.Body)
 			tasks := unblockPassTasks
-			if strings.Contains(string(body), "s-in-progress") {
+			if strings.Contains(string(body), "mr-watch-not-completed") {
 				tasks = mrWatchTasks
 			}
 			resp := map[string]any{"data": map[string]any{"tasks": tasks, "total": len(tasks), "filtered": len(tasks)}}
@@ -312,3 +345,138 @@ var errFakeGlab = &fakeGlabError{}
 type fakeGlabError struct{}
 
 func (e *fakeGlabError) Error() string { return "glab: not authenticated" }
+
+// TestCheckMRStatesOnce_NeedsInputMerged_NotesWithoutClosing and
+// TestCheckMRStatesOnce_TriageMerged_NotesWithoutClosing verify a task
+// parked in needs-input/triage whose MR merges gets a note, not an
+// auto-close: exactly one PUT with details carrying the merge note AND the
+// original ask block untouched, no "status" key in the PUT at all,
+// MRStates records "merged", an activity entry is appended, and
+// /status.needsActionTasks surfaces the task with mrState "merged".
+func TestCheckMRStatesOnce_NeedsInputMerged_NotesWithoutClosing(t *testing.T) {
+	testParkedStatusMergedNotesWithoutClosing(t, "needs-input")
+}
+
+func TestCheckMRStatesOnce_TriageMerged_NotesWithoutClosing(t *testing.T) {
+	testParkedStatusMergedNotesWithoutClosing(t, "triage")
+}
+
+func testParkedStatusMergedNotesWithoutClosing(t *testing.T, status string) {
+	t.Helper()
+	mrURL := "https://gitlab.example.com/team/project/-/merge_requests/11"
+	path := "Tasks/Parked-" + status + ".md"
+	askText := "Which environment should this ship to first?"
+	askDetails := renderNoteBody(noteBody{Ask: askText})
+	task := Task{
+		Path: path, Title: "Parked Task", Status: status,
+		Tags: []string{"claude"}, Projects: []string{"proj-parked"},
+		CustomProperties: map[string]string{"mr": mrURL},
+		Details:          askDetails,
+	}
+	apiSrv, puts := fakeMRWatcherAPI(t, []Task{task}, nil, map[string]Task{path: task})
+	client := NewClient(Config{URL: apiSrv.URL})
+	srv := newDueScannerTestServer(t, map[string]ProjectConfig{})
+	srv.tnClient = client
+
+	// Seed as "opened" first (no transition).
+	srv.checkMRStatesOnce(client, func(string) (string, error) { return "opened", nil })
+	if len(*puts) != 0 {
+		t.Fatalf("expected no PUT after the opened seed, got %+v", *puts)
+	}
+
+	// Now it merges.
+	srv.checkMRStatesOnce(client, func(string) (string, error) { return "merged", nil })
+
+	if len(*puts) != 1 {
+		t.Fatalf("expected exactly 1 PUT for the merge note, got %+v", *puts)
+	}
+	put := (*puts)[0]
+	if _, hasStatus := put["status"]; hasStatus {
+		t.Errorf("expected no status key in the PUT (task must stay in %s), got %+v", status, put)
+	}
+	details, _ := put["details"].(string)
+	if !strings.Contains(details, "MR merged") || !strings.Contains(details, mrURL) {
+		t.Errorf("expected the note to mention the merge and MR URL, got %q", details)
+	}
+	if !strings.Contains(details, status) {
+		t.Errorf("expected the note to mention the task was left in %s, got %q", status, details)
+	}
+	if !strings.Contains(details, askText) {
+		t.Errorf("expected the original ask block to survive the note untouched, got %q", details)
+	}
+
+	srv.mu.Lock()
+	gotState := srv.state.MRStates[path]
+	activity := append([]*ActivityEntry(nil), srv.state.Activity...)
+	srv.mu.Unlock()
+	if gotState != "merged" {
+		t.Errorf("expected MRStates[%q] = merged, got %q", path, gotState)
+	}
+	foundActivity := false
+	for _, a := range activity {
+		if strings.Contains(a.Text, "MR merged") && strings.Contains(a.Text, path) && strings.Contains(a.Text, status) {
+			foundActivity = true
+		}
+	}
+	if !foundActivity {
+		t.Errorf("expected an activity entry noting the merge while %s, got %+v", status, activity)
+	}
+
+	snap := dashboardSnapshot{MRStates: map[string]string{path: gotState}}
+	resp := buildStatusResponse(snap, nil, nil, []Task{task}, statusTaskCounts{}, nil, fixedRepoSettings(defaultRepoSettings()), time.Now(), 8391, false, nil, time.Time{}, 0, "", nil, nil, nil)
+	found := false
+	for _, nt := range resp.NeedsActionTasks {
+		if nt.Path == path {
+			found = true
+			if nt.MRState != "merged" {
+				t.Errorf("expected needsActionTasks[%q].mrState = merged, got %q", path, nt.MRState)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected %q in needsActionTasks, got %+v", path, resp.NeedsActionTasks)
+	}
+}
+
+// TestCheckMRStatesOnce_NeedsInputFirstSeenMerged_IsCatchUp verifies the
+// catch-up rule extends to needs-input (and triage): a task's very first
+// observation already shows "merged" while parked in needs-input — the MR
+// must have merged before the watcher ever saw this task (these statuses
+// were never polled before the query widened to every non-completed task,
+// so this first-observation case is exactly the one that matters) — and
+// that's still a legitimate note-worthy event, not just a silent seed.
+func TestCheckMRStatesOnce_NeedsInputFirstSeenMerged_IsCatchUp(t *testing.T) {
+	mrURL := "https://gitlab.example.com/team/project/-/merge_requests/12"
+	const path = "Tasks/NeedsInputCatchUp.md"
+	task := Task{
+		Path: path, Title: "Needs Input Task", Status: "needs-input",
+		Tags: []string{"claude"}, Projects: []string{"proj-parked"},
+		CustomProperties: map[string]string{"mr": mrURL},
+	}
+	apiSrv, puts := fakeMRWatcherAPI(t, []Task{task}, nil, map[string]Task{path: task})
+	client := NewClient(Config{URL: apiSrv.URL})
+	srv := newDueScannerTestServer(t, map[string]ProjectConfig{})
+	srv.tnClient = client
+
+	// First-ever observation already merged — no prior "opened" seed pass.
+	srv.checkMRStatesOnce(client, func(string) (string, error) { return "merged", nil })
+
+	if len(*puts) != 1 {
+		t.Fatalf("expected exactly 1 PUT (note catch-up), got %+v", *puts)
+	}
+	put := (*puts)[0]
+	if _, hasStatus := put["status"]; hasStatus {
+		t.Errorf("expected no status key in the catch-up PUT, got %+v", put)
+	}
+	details, _ := put["details"].(string)
+	if !strings.Contains(details, "MR merged") {
+		t.Errorf("expected a merge note, got %q", details)
+	}
+
+	srv.mu.Lock()
+	got := srv.state.MRStates[path]
+	srv.mu.Unlock()
+	if got != "merged" {
+		t.Errorf("expected MRStates[%q] = merged, got %q", path, got)
+	}
+}

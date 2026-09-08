@@ -31,3 +31,6 @@ coverage.html
 # just belt-and-suspenders for anything under webui/ that shouldn't be
 # tracked.
 webui/node_modules
+
+# Claude Code local session state (worktree task tracker); never part of the tree
+.claude/

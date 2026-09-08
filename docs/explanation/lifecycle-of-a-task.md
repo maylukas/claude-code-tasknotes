@@ -38,10 +38,11 @@ When a session calls `tn ask`, the task moves to `needs-input` and drops out of 
 
 ## 7. Review, merge, and the MR watcher
 
-For work with an associated GitLab merge request (`customProperties.mr`), a background MR watcher polls `glab` every 5 minutes over non-archived tasks in `review`, `in-progress`, or `open`, reacting only to an **observed change** in the MR's state since the last check:
+For work with an associated GitLab merge request (`customProperties.mr`), a background MR watcher polls `glab` every 5 minutes over every non-archived, non-completed task regardless of status — only tasks that actually have `customProperties.mr` set ever reach `glab`, so the call rate stays bounded to MR-bearing work — reacting only to an **observed change** in the MR's state since the last check:
 
-- **Merged**: a `review` or `in-progress` task auto-transitions straight to `done`, with a bridge-attributed note, then the unblock pass (below) runs immediately for anything that depended on it.
-- **Closed without merge**: a `review` task reopens to `in-progress`; either way, the task's owner (or a fallback agent, or the queue) gets an informational message to go investigate.
+- **Merged**: a `review` or `in-progress` task auto-transitions straight to `done`, with a bridge-attributed note, then the unblock pass (below) runs immediately for anything that depended on it. A task parked in `needs-input` or `triage` is **not** auto-closed — the open question or decision that parked it may still be real — instead it gets a bridge-attributed note recording the merge, and its status is left alone.
+- **Closed without merge**: a `review` task reopens to `in-progress`; a `needs-input`/`triage` task is likewise left alone, with a note recording the close. Either way, the task's owner (or a fallback agent, or the queue) gets an informational message to go investigate.
+- `/status.needsActionTasks[].mrState` (and the dashboard's Needs-your-action section) surfaces the watcher's last-observed state, so a needs-input task with an already-merged MR is visibly distinct from one still waiting on the pipeline.
 
 A task's dependents don't wait for the next 10-minute scan: the moment a task transitions to `done`, an unblock pass queries for open, dependency-bearing tasks that are now startable and routes an assignment for each, suffixed `[unblocked by <completed title>]`.
 

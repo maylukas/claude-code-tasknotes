@@ -40,7 +40,7 @@ Both should return a JSON health response. If `curl` fails, the HTTP API setting
 | `triage` | Parked for you. Appears in `/status`'s needs-your-action list and its dedicated triage summary; not auto-assigned. |
 | `in-progress` | Normal in-flight work. Not auto-(re)assigned via the tag path (an `@claude:` line still routes regardless of status). |
 | `needs-input` | Parked for you. Set by `tn ask` alongside the task's "Needs you" note block; cleared automatically the moment you reply with an `@claude:` line. |
-| `review` | Work awaiting merge. The MR watcher checks tasks in this status (along with `in-progress`/`open`) and can transition it to `done` when the linked MR merges, or back to `in-progress` if the MR closes without merging. |
+| `review` | Work awaiting merge. The MR watcher checks every non-completed task (not just this status) and can transition a `review` task to `done` when the linked MR merges, or back to `in-progress` if the MR closes without merging. A task parked in `needs-input`/`triage` whose MR merges or closes is only noted, never auto-transitioned. |
 | `done` | Terminal. Set by `tn done` (routed through the bridge's optional DONE MEANS evidence gate) or the daemon's `POST /tasks/close`. Mark this status **completed** in TaskNotes' own status settings (verified live against TaskNotes 4.12.3): this is what makes TaskNotes' own completion/archiving behavior, and its `task.completed` webhook event, fire correctly. |
 
 Every value above is case-sensitive and must match exactly what the code checks for; a status named "Done" instead of `done` (TaskNotes lets you set a separate display label, so this is easy to get wrong) won't be recognized.
