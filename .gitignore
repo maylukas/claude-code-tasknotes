@@ -1,0 +1,33 @@
+# Compiled binary
+/tasknotes-cli
+/tn
+
+# Backup files left by editors and ad-hoc patch workflows
+*.bak*
+
+# macOS
+.DS_Store
+
+# Working notes / scratch patches not meant for the tree
+proposed-patches/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.swp
+*.swo
+
+# Go test coverage output
+*.out
+coverage.txt
+coverage.html
+
+# webui/dist is DELIBERATELY NOT ignored here: serve.go embeds it via Go's
+# embed directive (`//go:embed all:webui/dist`), so the built bundle must be
+# committed for a fresh checkout to `go build` without needing Node/pnpm at
+# all. See CLAUDE.md's Build/test section. webui/ has its own .gitignore
+# that already carves dist/ out of its own ignore rules; the entry below is
+# just belt-and-suspenders for anything under webui/ that shouldn't be
+# tracked.
+webui/node_modules

@@ -1,0 +1,8 @@
+{
+  "name": "tasknotes",
+  "description": "Manage agent work tasks across sessions via Obsidian TaskNotes (tn CLI + bridge daemon)",
+  "version": "1.0.0",
+  "author": {
+    "name": "Lukas May"
+  }
+}

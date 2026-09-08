@@ -1,0 +1,9 @@
+{
+  "id": "tn-dashboard",
+  "name": "TN Dashboard",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.0",
+  "description": "Live sidebar view of the tn bridge daemon — needs-you tasks, stuck prompts, and running agents — without the scroll-flicker of the generated dashboard note.",
+  "author": "tn-serve-builder",
+  "isDesktopOnly": true
+}

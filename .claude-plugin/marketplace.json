@@ -1,0 +1,14 @@
+{
+  "name": "tasknotes-local",
+  "owner": {
+    "name": "Lukas May"
+  },
+  "plugins": [
+    {
+      "name": "tasknotes",
+      "source": "./",
+      "description": "Manage agent work tasks across sessions via Obsidian TaskNotes (tn CLI + bridge daemon)",
+      "version": "1.0.0"
+    }
+  ]
+}

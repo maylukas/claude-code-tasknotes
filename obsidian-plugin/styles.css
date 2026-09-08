@@ -1,0 +1,11 @@
+.tn-dashboard-iframe-container {
+  height: 100%;
+  padding: 0;
+}
+
+.tn-dashboard-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
