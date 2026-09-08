@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.8.0"
+const daemonVersion = "0.9.0"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -362,6 +362,12 @@ type ProjectConfig struct {
 	// unconfigured map) falls back to the safer-but-less-precise
 	// category-only request.
 	JiraStatusMap map[string]string `json:"jiraStatusMap,omitempty"`
+	// CodeHost overrides the MR watcher's URL-shape detection (see
+	// resolveCodeHost) for this project: "gitlab" or "github". Empty (the
+	// default) means "detect from the task's mr URL". An unrecognized value
+	// is warned about and treated as empty by resolveServeConfig — it never
+	// reaches resolveCodeHost's own override handling.
+	CodeHost string `json:"codeHost,omitempty"`
 }
 
 // EnvEntry describes one per-project environment variable for spawned
@@ -444,6 +450,13 @@ func resolveServeConfig(portFlag int) ServeConfig {
 					cfg.Port = fc.Port
 				}
 				for k, v := range fc.Projects {
+					switch v.CodeHost {
+					case "", "gitlab", "github":
+						// valid (or unset)
+					default:
+						log.Printf("serve: config: project %q has unknown codeHost %q (want \"gitlab\" or \"github\"); treating as unset (URL-shape detection)", k, v.CodeHost)
+						v.CodeHost = ""
+					}
 					// slugs are matched lowercase (see normalizeProjectSlug)
 					cfg.Projects[strings.ToLower(k)] = v
 				}

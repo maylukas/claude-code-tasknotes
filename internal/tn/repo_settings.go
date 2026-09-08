@@ -229,6 +229,22 @@ type Server struct {
 	// no-lock-needed convention as tnClient.
 	mrDiscussionsFunc mrDiscussionsFunc
 
+	// unsupportedHostWarnedOnce tracks which task paths already had an
+	// "unsupported change-request URL" (no codeHost provider matched, and
+	// no valid override) warned about for the CURRENT outage — same
+	// per-task-per-outage dedup convention as mrWatchWarnedOnce/
+	// mrReviewsWarnedOnce. Cleared per-task the moment host resolution
+	// succeeds again.
+	unsupportedHostWarnedOnce map[string]bool
+
+	// codeHostFunc resolves the codeHost provider for a change-request URL
+	// (see resolveCodeHost in codehost.go). nil (the zero value) means "use
+	// resolveCodeHost" — tests that exercise checkMRStatesOnceReal directly
+	// set this field to a fake resolver so no test ever execs glab or gh;
+	// the ~30 legacy MR-watcher tests instead call the checkMRStatesOnce
+	// compatibility wrapper, which never consults this field at all.
+	codeHostFunc func(changeURL string, override string) (codeHost, error)
+
 	dashboardPath    string
 	dashboardDeb     *debouncer
 	lastDashboardErr string
@@ -317,21 +333,22 @@ type Server struct {
 
 func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string) error) *Server {
 	s := &Server{
-		state:               loadState(statePath),
-		statePath:           statePath,
-		config:              cfg,
-		spawnFunc:           spawnFunc,
-		notify:              make(chan struct{}),
-		dashboardPath:       cfg.DashboardPath,
-		sessionPagesDir:     cfg.SessionPagesDir,
-		stuck:               newStuckTracker(),
-		sse:                 newSSEHub(),
-		mrWatchWarnedOnce:   map[string]bool{},
-		mrReviewsWarnedOnce: map[string]bool{},
-		repoSettings:        newRepoSettingsCache(),
-		startedAt:           time.Now(),
-		seenSinceStart:      map[string]bool{},
-		approveRescanDelay:  defaultApproveRescanDelay,
+		state:                     loadState(statePath),
+		statePath:                 statePath,
+		config:                    cfg,
+		spawnFunc:                 spawnFunc,
+		notify:                    make(chan struct{}),
+		dashboardPath:             cfg.DashboardPath,
+		sessionPagesDir:           cfg.SessionPagesDir,
+		stuck:                     newStuckTracker(),
+		sse:                       newSSEHub(),
+		mrWatchWarnedOnce:         map[string]bool{},
+		mrReviewsWarnedOnce:       map[string]bool{},
+		unsupportedHostWarnedOnce: map[string]bool{},
+		repoSettings:              newRepoSettingsCache(),
+		startedAt:                 time.Now(),
+		seenSinceStart:            map[string]bool{},
+		approveRescanDelay:        defaultApproveRescanDelay,
 	}
 	if s.dashboardPath != "" {
 		s.dashboardDeb = newDebouncer(dashboardDebounceInterval, s.renderDashboard)

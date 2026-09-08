@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Added
 
 - MR watcher now also tracks GitLab review-comment threads on an open MR: a new reviewer comment (never the acting agent's own) appends a note to the task and messages its owner, and `/status.needsActionTasks[].mrOpenThreads` (also surfaced on an agent's `ownedTasks`) reports the unresolved-thread count. `TN_NO_MRCOMMENTS=1` disables just this sub-pass.
+- GitHub pull requests are supported by the MR watcher next to GitLab merge requests; provider is detected from the URL or set per project with `codeHost`.
 
 ### Changed
 

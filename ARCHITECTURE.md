@@ -7,7 +7,7 @@ A codemap for `tasknotes-cli`: what lives where, and why, so you can find the ri
 Everything ships as one Go binary, `tn`. A thin `cmd/tn` entrypoint (package `main`) calls into `internal/tn` (package `tn`), which holds all the logic; stdlib only, no third-party Go modules. The binary does two unrelated-looking jobs from the same codebase:
 
 1. **CLI**: a thin wrapper around the TaskNotes Obsidian plugin's HTTP API (`internal/tn/api.go`), invoked as `tn <command>`.
-2. **Daemon**: `tn serve` runs an HTTP server on `127.0.0.1:8391` that bridges TaskNotes webhooks to Claude Code agent sessions running in tmux, plus a handful of background loops (spawn reconciliation, stuck-session detection, due-task scanning, an MR watcher, and more).
+2. **Daemon**: `tn serve` runs an HTTP server on `127.0.0.1:8391` that bridges TaskNotes webhooks to Claude Code agent sessions running in tmux, plus a handful of background loops (spawn reconciliation, stuck-session detection, due-task scanning, a merge/pull-request watcher, and more).
 
 These two jobs share the `Task`/`Client` types in `api.go` and the structured note-body logic in `note_layout.go`, but otherwise `main.go`'s CLI dispatch and the daemon's HTTP handlers are independent code paths. Two satellite subtrees, `webui/` (a React SPA embedded into the daemon at `GET /ui` via `webui/embed.go`) and `obsidian-plugin/` (a thin Obsidian panel that iframes it), have their own toolchains and are never Go dependencies of `internal/tn` — the daemon imports the small `tasknotes-cli/webui` package and serves its exported `webui.Dist` (an `embed.FS`).
 
@@ -54,7 +54,10 @@ The daemon used to be one large `serve.go` (see [design history](docs/explanatio
 | `ui.go` | `GET /ui`: serves the embedded `webui.Dist` bundle |
 | `webhook.go` | TaskNotes webhook handling (`handleTaskNotesWebhook`, routing, `@claude:` line extraction) and the daemon's own webhook self-registration with TaskNotes on startup |
 | `due_scanner.go` | Due-task scanner: picks up recurring/scheduled tasks that came due without a webhook |
-| `mr_watcher.go` | Polls `glab` for merge request state on tasks carrying an MR URL |
+| `mr_watcher.go` | MR/PR watcher orchestration: polls the resolved code-host provider for state on tasks carrying an `mr` URL |
+| `codehost.go` | `codeHost` provider interface + `resolveCodeHost` (URL-shape detection, per-project override) |
+| `codehost_gitlab.go` | GitLab provider (`gitlabHost`, via `glab`) |
+| `codehost_github.go` | GitHub provider (`githubHost`, via `gh`) |
 | `webhook_reconciler.go` | Webhook-miss reconciler: re-routes tasks modified while the daemon was briefly down |
 | `spawn.go` | Orchestrator startup: builds the launch command, starts/reuses a tmux session |
 | `spawn_reconciler.go` | Spawn reconciler: retries failed spawns, scales out additional generations |
@@ -87,7 +90,7 @@ Each runs as its own goroutine, started from `cmdServe`:
 | Stuck session detector | 2m (`stuckCheckInterval`) | tmux pane-scrape for permission prompts; re-prompts a stuck dialog every 15m (`stuckDialogRepromptInterval`) |
 | Sleep detector | 30s (`sleepCheckInterval`) | Detects the host having slept and re-baselines liveness checks |
 | Due-task scanner / webhook-miss reconciler | 10m (`dueScannerInterval`), shared cadence | Picks up recurring tasks and re-routes tasks TaskNotes' webhook missed |
-| MR watcher | 5m (`mrWatchInterval`) | Polls `glab` for merge request state transitions |
+| MR watcher | 5m (`mrWatchInterval`) | Polls the resolved code-host provider (`glab` or `gh`) for merge/pull-request state transitions |
 | Worktree reaper sweep | 30m default (`worktreeReaperDefaultInterval`), configurable | Removes eligible finished worktrees |
 | Dashboard render debounce | 2s (`dashboardDebounceInterval`) | Coalesces rapid state mutations into one render |
 | SSE heartbeat | 30s (`sseHeartbeatInterval`) | Keeps `/events` connections alive |

@@ -65,6 +65,7 @@ A few things follow from that shape, worth knowing up front:
 - **Go 1.26+** to build (standard library only, no external Go dependencies).
 - **Obsidian** with the [TaskNotes](https://github.com/callumalpass/tasknotes) plugin, HTTP API enabled. See [`docs/how-to/set-up-tasknotes.md`](docs/how-to/set-up-tasknotes.md) for the full TaskNotes-side configuration (statuses, user fields, tags) `tn` depends on.
 - **tmux** and the **Claude Code CLI** if you want `tn serve`'s orchestrator-spawning features.
+- **`glab`** and/or **`gh`**, if you want the MR watcher: `glab` for GitLab merge requests, `gh` for GitHub pull requests. The provider is detected from the task's MR/PR URL, or forced per project — see [`docs/reference/configuration.md`](docs/reference/configuration.md).
 - **macOS** for the daemon's dialog prompts, Keychain-backed credential profiles, and launchd supervision. The daemon core is portable Go and runs on Linux, but those macOS-specific features (`osascript` dialogs, `/usr/bin/security`, `codesign`, launchd) are unavailable there.
 - **Node.js + pnpm**, only if you're changing the embedded web UI (`webui/`).
 
@@ -118,7 +119,7 @@ Full key-by-key reference: [`docs/reference/configuration.md`](docs/reference/co
 
 ## Features
 
-- Full task CRUD against the TaskNotes HTTP API, including dependencies, Jira linkage, and MR tracking (state changes and reviewer comments): [`docs/reference/cli.md`](docs/reference/cli.md)
+- Full task CRUD against the TaskNotes HTTP API, including dependencies, Jira linkage, and merge/pull-request tracking (state changes and reviewer comments, GitLab and GitHub both): [`docs/reference/cli.md`](docs/reference/cli.md)
 - A structured, foldable task-note body (ask / brief / description / history) instead of a flat log: [`docs/reference/note-layout.md`](docs/reference/note-layout.md)
 - A local bridge daemon (`tn serve`) with an agent registry, message bus, and webhook routing: [`docs/reference/http-api.md`](docs/reference/http-api.md)
 - Automatic orchestrator spawning in tmux, with generation-based rolling replacement instead of hard rotation: [`docs/explanation/generations-and-drain.md`](docs/explanation/generations-and-drain.md)

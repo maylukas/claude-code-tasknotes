@@ -44,6 +44,7 @@ Env variables are applied *after* the file, so they always win.
 | `cwd` | string | `""` | Absolute path to the project's working directory, used as the spawn location. |
 | `env` | object, `{name: EnvEntry}` | none | Per-project environment entries injected into the spawned orchestrator's environment. See [Env entries](#env-entries). |
 | `jiraStatusMap` | object, `{taskStatus: jiraStatusName}` | none | Maps a TaskNotes task status (e.g. `in-progress`, `review`, `done`) to this project's actual Jira workflow status *name* to transition to, not a status category. Configurable per project because different Jira projects and issue types have different workflow graphs: a project's "board done" status may sit several transitions before its true category-done status, reached only after a later step like acceptance testing or release. A task status with no entry in this map (including an entirely unconfigured map) falls back to a safer, less precise category-only Jira transition request. |
+| `codeHost` | string, `"gitlab"` or `"github"` | none (detect from URL) | Forces the MR watcher's provider for this project's tasks instead of detecting it from the `mr` field's URL shape. An unrecognized value is logged as a warning at daemon startup and treated as unset. |
 
 ### Env entries
 
@@ -118,7 +119,8 @@ Not configurable (hardcoded): an initial 2-minute delay before the first pass af
         "in-progress": "In Development",
         "review": "Code Review",
         "done": "Merged"
-      }
+      },
+      "codeHost": "github"
     }
   }
 }
@@ -200,7 +202,7 @@ These are set by the daemon into the environment of a process it spawns; they're
 
 > **Note:** `ORCHESTRATOR.md` (the operating contract read by daemon-spawned sessions) is located at startup, in this order: the `TN_ORCHESTRATOR_DOC` environment variable, `serve.json`'s `orchestratorDoc` key, `~/.config/tn/ORCHESTRATOR.md`, `ORCHESTRATOR.md` next to the `tn` binary, then `./ORCHESTRATOR.md` in the daemon's working directory. The first existing file wins; the daemon logs `serve: orchestrator contract: <path>` at startup, or a warning naming the two ways to set it when none is found. Copy the file from this repository to `~/.config/tn/` or point `orchestratorDoc` at your checkout.
 
-> **Note:** the MR watcher (`TN_NO_MRWATCH` above) invokes the `glab` CLI, resolved from `/opt/homebrew/bin/glab`, `/usr/local/bin/glab`, `/usr/bin/glab`, then `glab` on `$PATH`. Its review-comment sub-pass (`TN_NO_MRCOMMENTS` above) makes two further `glab api` calls per open MR-bearing task — one for the MR resource itself (to learn its author, so the watcher never reacts to the agent's own comments) and one for its discussions — only for a task whose MR is currently `"opened"`.
+> **Note:** the MR watcher (`TN_NO_MRWATCH` above) supports both GitLab (via the `glab` CLI, resolved from `/opt/homebrew/bin/glab`, `/usr/local/bin/glab`, `/usr/bin/glab`, then `glab` on `$PATH`) and GitHub (via `gh`, resolved the same way from `/opt/homebrew/bin/gh`, `/usr/local/bin/gh`, `/usr/bin/gh`, then `gh` on `$PATH`) — the provider is detected from the task's `mr` URL shape, or forced per project with `codeHost` above. Its review-comment sub-pass (`TN_NO_MRCOMMENTS` above) makes further provider API calls per open MR/PR-bearing task — for GitLab, one `glab api` call for the MR resource itself (to learn its author, so the watcher never reacts to the agent's own comments) and one for its discussions; for GitHub, one `gh api graphql` call covering the PR's author, review threads, and top-level comments — only for a task whose MR/PR is currently `"opened"`.
 
 The LaunchAgent plist (macOS service supervisor) is not written by `tn`. It's a user-created file. Logs (for example `~/Library/Logs/tn-serve.log`) exist only if something external redirects the daemon's stdout/stderr to a file. `tn serve` itself never opens or writes a log file; it only calls Go's standard `log` package, which goes to stderr by default. See [../how-to/run-as-a-service.md](../how-to/run-as-a-service.md) for a working LaunchAgent example.
 

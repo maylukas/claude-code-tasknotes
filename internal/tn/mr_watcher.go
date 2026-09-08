@@ -1,12 +1,9 @@
 package tn
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -45,88 +42,19 @@ func buildMRWatchQuery() filterNode {
 	}
 }
 
-// mrStateFunc resolves a GitLab MR URL to its current state
-// ("opened"/"merged"/"closed"), injectable so tests never exec glab.
+// mrStateFunc resolves a merge/pull-request URL to its current state
+// ("opened"/"merged"/"closed"), injectable so tests never exec glab/gh. A
+// codeHost's ChangeState method value satisfies this type directly.
 type mrStateFunc func(mrURL string) (string, error)
-
-// parseMRURL extracts glab's "-R" project path (group/subgroup/.../project
-// — nested groups are common and must be preserved whole) and the merge
-// request iid from a GitLab MR URL of the form
-// https://<host>/<group/.../project>/-/merge_requests/<iid>.
-func parseMRURL(rawURL string) (project, iid string, ok bool) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", "", false
-	}
-	const marker = "/-/merge_requests/"
-	idx := strings.Index(u.Path, marker)
-	if idx <= 0 {
-		return "", "", false
-	}
-	project = strings.Trim(u.Path[:idx], "/")
-	iid = strings.Trim(u.Path[idx+len(marker):], "/")
-	if project == "" || iid == "" {
-		return "", "", false
-	}
-	for _, r := range iid {
-		if r < '0' || r > '9' {
-			return "", "", false
-		}
-	}
-	return project, iid, true
-}
-
-// resolveGlabBin finds glab by absolute path — under launchd the daemon's
-// PATH lacks the Homebrew dirs, so a bare "glab" is not found (same
-// reasoning as resolveTmuxBin above).
-func resolveGlabBin() string {
-	for _, p := range []string{"/opt/homebrew/bin/glab", "/usr/local/bin/glab", "/usr/bin/glab"} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "glab"
-}
-
-// glabMRState is mrStateFunc's real implementation: parses the MR URL,
-// then shells out to the authenticated glab CLI. HOME is set explicitly
-// (not just inherited) since under launchd the daemon's ambient
-// environment can be stripped down, same class of gotcha as tmux's
-// absolute-path resolution elsewhere in this file.
-func glabMRState(mrURL string) (string, error) {
-	project, iid, ok := parseMRURL(mrURL)
-	if !ok {
-		return "", fmt.Errorf("unparseable MR URL: %s", mrURL)
-	}
-	cmd := exec.Command(resolveGlabBin(), "mr", "view", iid, "-R", project, "-F", "json")
-	cmd.Env = os.Environ()
-	if home, err := os.UserHomeDir(); err == nil {
-		cmd.Env = append(cmd.Env, "HOME="+home)
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return "", err
-	}
-	if resp.State == "" {
-		return "", fmt.Errorf("glab returned no state for %s", mrURL)
-	}
-	return resp.State, nil
-}
 
 // --- MR review-comment watching ---
 
-// mrNote is one note (comment) within a GitLab MR discussion thread, as
-// returned by GET /projects/:id/merge_requests/:iid/discussions. Parsed
-// defensively — a missing/unexpected field just yields its zero value,
-// never an error, since a discussions payload is expected to vary (a
-// diff-note carries position data this watcher doesn't need at all, a
-// system note carries no useful Author for our purposes, etc).
+// mrNote is one note (comment) within an MR/PR discussion thread, as
+// returned by either provider's codeHost.Discussions. Parsed defensively —
+// a missing/unexpected field just yields its zero value, never an error,
+// since a discussions payload is expected to vary (a diff-note carries
+// position data this watcher doesn't need at all, a system note carries no
+// useful Author for our purposes, etc).
 type mrNote struct {
 	ID         int
 	Author     string
@@ -137,19 +65,20 @@ type mrNote struct {
 	CreatedAt  time.Time
 }
 
-// mrDiscussions is one MR's review-comment state as fetched by
+// mrDiscussions is one MR/PR's review-comment state as fetched by
 // mrDiscussionsFunc: its author (an MR watcher note authored by the same
-// user as the MR itself is presumed to be the acting agent posting on the
-// user's behalf — e.g. replying to its own thread — and never counts as
+// user as the MR/PR itself is presumed to be the acting agent posting on
+// the user's behalf — e.g. replying to its own thread — and never counts as
 // new reviewer activity) plus every discussion thread, each thread an
-// ordered slice of notes exactly as GitLab returns them.
+// ordered slice of notes exactly as the provider returns them.
 type mrDiscussions struct {
 	MRAuthor string
 	Threads  [][]mrNote
 }
 
-// mrDiscussionsFunc resolves a GitLab MR URL to its discussion threads,
-// injectable (like mrStateFunc) so tests never exec glab.
+// mrDiscussionsFunc resolves a merge/pull-request URL to its discussion
+// threads, injectable (like mrStateFunc) so tests never exec glab/gh. A
+// codeHost's Discussions method value satisfies this type directly.
 type mrDiscussionsFunc func(mrURL string) (mrDiscussions, error)
 
 // mrReviewState is State.MRReviews' per-task value: enough to detect new
@@ -168,108 +97,6 @@ type mrReviewState struct {
 	// LastNotifiedAt is when a reviewer-comment notification was last sent
 	// for this task (zero value: never, including the silent first-seed).
 	LastNotifiedAt time.Time `json:"lastNotifiedAt,omitempty"`
-}
-
-// mrDiscussionsAPIPath and mrResourceAPIPath build glab's "api" subcommand
-// path for an MR's discussions / the MR resource itself, from mrURL —
-// factored out from glabMRDiscussions so the URL-building and project-path
-// escaping is directly unit-testable without exec'ing glab. per_page=100
-// bounds the discussions fetch to a first-page snapshot (a GitLab MR with
-// more than 100 discussion THREADS, not notes, in flight is vanishingly
-// rare, and the watcher only needs a bounded per-pass read, not exhaustive
-// pagination).
-func mrDiscussionsAPIPath(mrURL string) (string, error) {
-	project, iid, ok := parseMRURL(mrURL)
-	if !ok {
-		return "", fmt.Errorf("unparseable MR URL: %s", mrURL)
-	}
-	return fmt.Sprintf("projects/%s/merge_requests/%s/discussions?per_page=100", url.PathEscape(project), iid), nil
-}
-
-func mrResourceAPIPath(mrURL string) (string, error) {
-	project, iid, ok := parseMRURL(mrURL)
-	if !ok {
-		return "", fmt.Errorf("unparseable MR URL: %s", mrURL)
-	}
-	return fmt.Sprintf("projects/%s/merge_requests/%s", url.PathEscape(project), iid), nil
-}
-
-// runGlabAPI shells out to `glab api <path>` and decodes the JSON response
-// into out. Same HOME/env handling as glabMRState, for the same launchd
-// reason.
-func runGlabAPI(path string, out any) error {
-	cmd := exec.Command(resolveGlabBin(), "api", path)
-	cmd.Env = os.Environ()
-	if home, err := os.UserHomeDir(); err == nil {
-		cmd.Env = append(cmd.Env, "HOME="+home)
-	}
-	b, err := cmd.Output()
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(b, out)
-}
-
-// glabMRDiscussions is mrDiscussionsFunc's real implementation. It makes
-// TWO glab calls: one for the MR resource itself (to learn its author's
-// username) and one for its discussions. This — rather than extending
-// glabMRState's JSON parsing to also capture author.username, the other
-// option raised when this was designed — was chosen because mrStateFunc's
-// (string, error) signature is used pervasively (checkTaskMRState and
-// every existing MR-watcher test): widening it to also return an author
-// would ripple through all of them for a value only the review-comment
-// path needs. An isolated second call keeps that blast radius to this one
-// function.
-func glabMRDiscussions(mrURL string) (mrDiscussions, error) {
-	discPath, err := mrDiscussionsAPIPath(mrURL)
-	if err != nil {
-		return mrDiscussions{}, err
-	}
-	resourcePath, err := mrResourceAPIPath(mrURL)
-	if err != nil {
-		return mrDiscussions{}, err
-	}
-
-	var resource struct {
-		Author struct {
-			Username string `json:"username"`
-		} `json:"author"`
-	}
-	if err := runGlabAPI(resourcePath, &resource); err != nil {
-		return mrDiscussions{}, err
-	}
-
-	var raw []struct {
-		Notes []struct {
-			ID         int    `json:"id"`
-			Body       string `json:"body"`
-			System     bool   `json:"system"`
-			Resolvable bool   `json:"resolvable"`
-			Resolved   bool   `json:"resolved"`
-			Author     struct {
-				Username string `json:"username"`
-			} `json:"author"`
-			CreatedAt string `json:"created_at"`
-		} `json:"notes"`
-	}
-	if err := runGlabAPI(discPath, &raw); err != nil {
-		return mrDiscussions{}, err
-	}
-
-	out := mrDiscussions{MRAuthor: resource.Author.Username}
-	for _, d := range raw {
-		thread := make([]mrNote, 0, len(d.Notes))
-		for _, n := range d.Notes {
-			created, _ := time.Parse(time.RFC3339, n.CreatedAt) // zero value on parse failure — never fatal
-			thread = append(thread, mrNote{
-				ID: n.ID, Author: n.Author.Username, Body: n.Body,
-				System: n.System, Resolvable: n.Resolvable, Resolved: n.Resolved,
-				CreatedAt: created,
-			})
-		}
-		out.Threads = append(out.Threads, thread)
-	}
-	return out, nil
 }
 
 // collapseWhitespace joins s's whitespace-separated fields with a single
@@ -412,35 +239,70 @@ func (s *Server) checkTaskMRReviews(client *Client, discussions mrDiscussionsFun
 	s.triggerRenders()
 }
 
-// startMRWatcher launches a background goroutine that checks GitLab MR
-// state for every non-completed task with a customProperties.mr URL set,
-// transitioning the task's status on an OBSERVED state change (see
+// startMRWatcher launches a background goroutine that checks merge/pull
+// request state for every non-completed task with a customProperties.mr URL
+// set, transitioning the task's status on an OBSERVED state change (see
 // checkMRStateOnce). Disabled when TN_NO_MRWATCH=1 (tests and smoke runs
 // that start the real daemon should set this).
 func (s *Server) startMRWatcher(client *Client) {
 	if os.Getenv("TN_NO_MRWATCH") == "1" {
 		return
 	}
-	// Set once, before the ticker goroutine is spawned below — the `go`
-	// statement itself is a happens-before edge (Go memory model), so no
-	// separate synchronization is needed for the goroutine's later reads.
-	s.mrDiscussionsFunc = glabMRDiscussions
 	go func() {
 		time.Sleep(mrWatchInitialDelay)
-		s.checkMRStatesOnce(client, glabMRState)
+		s.checkMRStatesOnceReal(client)
 
 		ticker := time.NewTicker(mrWatchInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.checkMRStatesOnce(client, glabMRState)
+			s.checkMRStatesOnceReal(client)
 		}
 	}()
 }
 
-// checkMRStatesOnce is one MR-watcher pass, factored out of the ticker loop
-// so it's directly testable with an injected mrStateFunc (tests never exec
-// glab) and TaskNotes client (a fake httptest server).
+// checkMRStatesOnceReal is the production MR-watcher pass: for each task it
+// resolves a codeHost (GitLab or GitHub, by URL shape or the task's
+// project's codeHost override) via s.codeHostFunc, defaulting to
+// resolveCodeHost.
+func (s *Server) checkMRStatesOnceReal(client *Client) {
+	s.checkMRStatesOnceCore(client, func(t Task, mrURL string) (codeHost, error) {
+		hostFunc := s.codeHostFunc
+		if hostFunc == nil {
+			hostFunc = resolveCodeHost
+		}
+		return hostFunc(mrURL, s.codeHostOverrideForTask(t))
+	})
+}
+
+// codeHostOverrideForTask returns the codeHost override configured for t's
+// routed project (ProjectConfig.CodeHost), or "" when none is set / t
+// doesn't route to a known project.
+func (s *Server) codeHostOverrideForTask(t Task) string {
+	slug := routingSlugForTask(t)
+	if slug == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.projectConfigFor(strings.ToLower(slug)).CodeHost
+}
+
+// checkMRStatesOnce is a compatibility wrapper preserved for the ~30
+// existing call sites (mr_watcher_test.go, mr_reviews_test.go) that inject
+// an mrStateFunc directly and predate the multi-provider codeHost
+// abstraction. It installs a funcCodeHost wrapping mrState (for
+// ChangeState) and s.mrDiscussionsFunc, read fresh on each call (for
+// Discussions) — exactly the glab-shaped single-provider pass those tests
+// were written against.
 func (s *Server) checkMRStatesOnce(client *Client, mrState mrStateFunc) {
+	host := funcCodeHost{changeState: mrState, discussions: s.mrDiscussionsFunc}
+	s.checkMRStatesOnceCore(client, func(Task, string) (codeHost, error) { return host, nil })
+}
+
+// checkMRStatesOnceCore is one MR-watcher pass, factored out so it's
+// directly testable with an injected host resolver and TaskNotes client (a
+// fake httptest server) — tests never exec glab or gh.
+func (s *Server) checkMRStatesOnceCore(client *Client, hostFor func(t Task, mrURL string) (codeHost, error)) {
 	if client == nil {
 		return
 	}
@@ -464,31 +326,85 @@ func (s *Server) checkMRStatesOnce(client *Client, mrState mrStateFunc) {
 		if mrURL == "" {
 			continue
 		}
-		s.checkTaskMRState(client, mrState, t, mrURL)
 
-		// Review-comment watching only makes sense for an MR that's still
-		// open — merged/closed MRs don't need thread tracking. s.mrDiscussionsFunc
-		// is nil for most existing tests (which predate this feature and
-		// never set it, same convention as s.tnClient) — treated as "review
-		// watching not wired up this pass" rather than a nil-func call.
-		if s.mrDiscussionsFunc != nil {
+		host, err := hostFor(t, mrURL)
+		if err != nil {
+			s.mu.Lock()
+			alreadyWarned := s.unsupportedHostWarnedOnce[t.Path]
+			s.unsupportedHostWarnedOnce[t.Path] = true
+			s.mu.Unlock()
+			if !alreadyWarned {
+				log.Printf("serve: mr watcher: %s (%s): %v", t.Path, mrURL, err)
+			}
+			continue
+		}
+		s.mu.Lock()
+		s.unsupportedHostWarnedOnce[t.Path] = false
+		s.mu.Unlock()
+
+		s.checkTaskMRState(client, host.ChangeState, t, mrURL)
+
+		// Review-comment watching only makes sense for an MR/PR that's
+		// still open — merged/closed ones don't need thread tracking. A
+		// codeHost that implements discussionsOptional (the funcCodeHost
+		// test double used by checkMRStatesOnce above) may report it has no
+		// discussions wired up at all — most legacy tests predate the
+		// review-comment feature and never set mrDiscussionsFunc — treated
+		// as "review watching not wired up this pass" rather than an
+		// always-failing Discussions call. Real providers (gitlabHost,
+		// githubHost) don't implement discussionsOptional, so this is
+		// always true for them.
+		discussionsConfigured := true
+		if do, ok := host.(discussionsOptional); ok {
+			discussionsConfigured = do.discussionsConfigured()
+		}
+		if discussionsConfigured {
 			s.mu.Lock()
 			state := s.state.MRStates[t.Path]
 			s.mu.Unlock()
 			if state == "opened" {
-				s.checkTaskMRReviews(client, s.mrDiscussionsFunc, t, mrURL)
+				s.checkTaskMRReviews(client, host.Discussions, t, mrURL)
 			}
 		}
 	}
 }
 
-// checkTaskMRState resolves the current MR state for one task and, if it
+// funcCodeHost is a codeHost test double built from a bare mrStateFunc /
+// mrDiscussionsFunc pair — see checkMRStatesOnce's doc comment. It
+// implements discussionsOptional so checkMRStatesOnceCore can tell whether
+// discussions were actually wired up for this pass.
+type funcCodeHost struct {
+	changeState mrStateFunc
+	discussions mrDiscussionsFunc
+}
+
+func (h funcCodeHost) Name() string                             { return "gitlab" }
+func (h funcCodeHost) Matches(string) bool                      { return true }
+func (h funcCodeHost) ChangeState(mrURL string) (string, error) { return h.changeState(mrURL) }
+func (h funcCodeHost) Discussions(mrURL string) (mrDiscussions, error) {
+	if h.discussions == nil {
+		return mrDiscussions{}, fmt.Errorf("discussions not configured")
+	}
+	return h.discussions(mrURL)
+}
+func (h funcCodeHost) discussionsConfigured() bool { return h.discussions != nil }
+
+// discussionsOptional is implemented only by funcCodeHost — a codeHost that
+// may not have review-comment discussions wired up. Real providers
+// (gitlabHost, githubHost) don't implement it, so a type assertion against
+// this interface naturally treats them as always-capable. See
+// checkMRStatesOnceCore.
+type discussionsOptional interface {
+	discussionsConfigured() bool
+}
+
+// checkTaskMRState resolves the current MR/PR state for one task and, if it
 // represents a genuine change (or the one legitimate first-observation
 // catch-up — see below), transitions the task accordingly, then records
-// the observed state either way. A failed lookup (unparseable URL or glab
-// error) never mutates MRStates — a later successful pass just picks up
-// wherever the last confirmed state left off — and is logged once per task
-// per outage via mrWatchWarnedOnce.
+// the observed state either way. A failed lookup (unparseable URL or a
+// provider CLI error) never mutates MRStates — a later successful pass just
+// picks up wherever the last confirmed state left off — and is logged once
+// per task per outage via mrWatchWarnedOnce.
 func (s *Server) checkTaskMRState(client *Client, mrState mrStateFunc, t Task, mrURL string) {
 	state, err := mrState(mrURL)
 	if err != nil {

@@ -52,7 +52,7 @@ Under **Settings > User fields**, add a custom field for each key below. The **k
 | Key | Used by | Required? |
 |---|---|---|
 | `claude-project` | Bridge routing (which project a task belongs to) | **Required** for the bridge to route any task at all |
-| `mr` | MR watcher (merge/pull request URL) | Optional |
+| `mr` | MR watcher (GitLab merge-request or GitHub pull-request URL) | Optional |
 | `integration-branch` | Workstream target branch | Optional |
 | `integration-role` | Workstream ownership (`owner` holds the consolidated MR) | Optional |
 | `jira` | Jira transition requests | Optional, see [Jira integration](jira-integration.md) |
