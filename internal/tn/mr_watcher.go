@@ -19,6 +19,13 @@ const (
 	// convention (a fresh daemon shouldn't wait a full interval to catch
 	// an MR that merged/closed while it was down).
 	mrWatchInitialDelay = 45 * time.Second
+	// mrReviewRefreshEvery is how often (in checkMRStatesOnceCore passes)
+	// the incremental path re-fetches discussions for every open MR in a
+	// group, even ones the incremental listing found unchanged — belt and
+	// braces against a review thread being resolved without the MR's own
+	// updated_at moving in a way this watcher notices otherwise. At
+	// mrWatchInterval (5min) this is ~30min.
+	mrReviewRefreshEvery = 6
 )
 
 // buildMRWatchQuery builds the FilterQuery for the MR watcher: every
@@ -299,9 +306,70 @@ func (s *Server) checkMRStatesOnce(client *Client, mrState mrStateFunc) {
 	s.checkMRStatesOnceCore(client, func(Task, string) (codeHost, error) { return host, nil })
 }
 
+// mrGroupTask is one MR-bearing task queued for processing by
+// checkMRStatesOnceCore, alongside the codeHost already resolved for it (so
+// grouping/fallback never needs to re-resolve).
+type mrGroupTask struct {
+	task  Task
+	mrURL string
+	host  codeHost
+}
+
+// checkMRStatesOnceDiscussions runs t's review-comment check when host has
+// discussions wired up (see discussionsOptional's doc comment) and its
+// last-observed MRStates entry is "opened" — merged/closed MRs don't need
+// thread tracking, and this always reads MRStates fresh rather than trusting
+// a caller-computed value, so it's correct whether or not t's state was
+// actually re-checked this pass (the incremental path's periodic refresh
+// calls this for tasks it otherwise skipped entirely — see
+// checkMRStatesOnceCore).
+// It reports whether it actually fetched (for the incremental path's
+// per-project log line) — false covers both "discussions not configured
+// for this host" and "not currently opened".
+func (s *Server) checkMRStatesOnceDiscussions(client *Client, mt mrGroupTask) bool {
+	discussionsConfigured := true
+	if do, ok := mt.host.(discussionsOptional); ok {
+		discussionsConfigured = do.discussionsConfigured()
+	}
+	if !discussionsConfigured {
+		return false
+	}
+	s.mu.Lock()
+	state := s.state.MRStates[mt.task.Path]
+	s.mu.Unlock()
+	if state != "opened" {
+		return false
+	}
+	s.checkTaskMRReviews(client, mt.host.Discussions, mt.task, mt.mrURL)
+	return true
+}
+
+// checkMRStatesOnceIndividual is the original one-call-per-task path: used
+// for every task whose codeHost doesn't support incremental listing (no
+// incrementalCodeHost/projectPathHost), for every task when
+// TN_NO_MRINCREMENTAL=1, and as the fallback for an entire incremental
+// group when its ChangedSince call itself fails this pass (so a provider
+// hiccup never hides a merge/close — see checkMRStatesOnceCore).
+func (s *Server) checkMRStatesOnceIndividual(client *Client, mt mrGroupTask) {
+	s.checkTaskMRState(client, mt.host.ChangeState, mt.task, mt.mrURL)
+	s.checkMRStatesOnceDiscussions(client, mt)
+}
+
 // checkMRStatesOnceCore is one MR-watcher pass, factored out so it's
 // directly testable with an injected host resolver and TaskNotes client (a
 // fake httptest server) — tests never exec glab or gh.
+//
+// Tasks are split into two paths. A task whose resolved codeHost implements
+// both incrementalCodeHost and projectPathHost (gitlabHost today — see
+// codehost.go) is grouped with every other task sharing that
+// "<codeHost.Name()>|<projectPath>" key and processed via ChangedSince: one
+// listing call per project, then per-task work only for what the listing
+// says changed plus any task never seen before (first observation always
+// needs an individual ChangeState call regardless of the listing, so
+// seeding still works for an MR that predates the watcher). Everything else
+// — a non-incremental host, TN_NO_MRINCREMENTAL=1, or a group whose
+// ChangedSince call itself failed — goes through
+// checkMRStatesOnceIndividual exactly as before this feature existed.
 func (s *Server) checkMRStatesOnceCore(client *Client, hostFor func(t Task, mrURL string) (codeHost, error)) {
 	if client == nil {
 		return
@@ -311,6 +379,22 @@ func (s *Server) checkMRStatesOnceCore(client *Client, hostFor func(t Task, mrUR
 		log.Printf("serve: mr watcher: TaskNotes API query failed: %v", err)
 		return
 	}
+
+	s.mu.Lock()
+	s.mrWatchPassCount++
+	refreshPass := s.mrWatchPassCount%mrReviewRefreshEvery == 0
+	s.mu.Unlock()
+
+	noIncremental := os.Getenv("TN_NO_MRINCREMENTAL") == "1"
+
+	type incGroup struct {
+		host        incrementalCodeHost
+		projectPath string
+		tasks       []mrGroupTask
+	}
+	groups := map[string]*incGroup{}
+	var individual []mrGroupTask
+
 	for _, t := range tasks {
 		// Self-healing re-arm (see observeTaskStatusLocked): the MR watcher
 		// observes every non-completed task every 5min, one more vantage
@@ -342,30 +426,89 @@ func (s *Server) checkMRStatesOnceCore(client *Client, hostFor func(t Task, mrUR
 		s.unsupportedHostWarnedOnce[t.Path] = false
 		s.mu.Unlock()
 
-		s.checkTaskMRState(client, host.ChangeState, t, mrURL)
+		mt := mrGroupTask{task: t, mrURL: mrURL, host: host}
 
-		// Review-comment watching only makes sense for an MR/PR that's
-		// still open — merged/closed ones don't need thread tracking. A
-		// codeHost that implements discussionsOptional (the funcCodeHost
-		// test double used by checkMRStatesOnce above) may report it has no
-		// discussions wired up at all — most legacy tests predate the
-		// review-comment feature and never set mrDiscussionsFunc — treated
-		// as "review watching not wired up this pass" rather than an
-		// always-failing Discussions call. Real providers (gitlabHost,
-		// githubHost) don't implement discussionsOptional, so this is
-		// always true for them.
-		discussionsConfigured := true
-		if do, ok := host.(discussionsOptional); ok {
-			discussionsConfigured = do.discussionsConfigured()
+		incHost, isInc := host.(incrementalCodeHost)
+		pathHost, hasPath := host.(projectPathHost)
+		if noIncremental || !isInc || !hasPath {
+			individual = append(individual, mt)
+			continue
 		}
-		if discussionsConfigured {
+		projectPath, ok := pathHost.projectPathOf(mrURL)
+		if !ok {
+			individual = append(individual, mt)
+			continue
+		}
+		key := host.Name() + "|" + projectPath
+		g, exists := groups[key]
+		if !exists {
+			g = &incGroup{host: incHost, projectPath: projectPath}
+			groups[key] = g
+		}
+		g.tasks = append(g.tasks, mt)
+	}
+
+	for key, g := range groups {
+		s.mu.Lock()
+		cursor := s.state.MRCursors[key]
+		s.mu.Unlock()
+
+		changes, newest, err := g.host.ChangedSince(g.projectPath, cursor)
+		if err != nil {
 			s.mu.Lock()
-			state := s.state.MRStates[t.Path]
+			alreadyWarned := s.mrCursorWarnedOnce[key]
+			s.mrCursorWarnedOnce[key] = true
 			s.mu.Unlock()
-			if state == "opened" {
-				s.checkTaskMRReviews(client, host.Discussions, t, mrURL)
+			if !alreadyWarned {
+				log.Printf("serve: mr watcher: %s: incremental listing failed, falling back to per-task polling: %v", key, err)
+			}
+			individual = append(individual, g.tasks...)
+			continue
+		}
+		s.mu.Lock()
+		s.mrCursorWarnedOnce[key] = false
+		newCursor := s.state.MRCursors[key]
+		if newest.After(newCursor) {
+			newCursor = newest
+		}
+		s.state.MRCursors[key] = newCursor
+		s.saveLocked()
+		s.mu.Unlock()
+
+		changedCount, polledCount, discCount := 0, 0, 0
+		for _, mt := range g.tasks {
+			s.mu.Lock()
+			_, seen := s.state.MRStates[mt.task.Path]
+			s.mu.Unlock()
+
+			processed := false
+			switch listedState, inChanges := changes[mt.mrURL]; {
+			case !seen:
+				// First-ever observation always gets an individual
+				// ChangeState call, whether or not the listing happened to
+				// include it — seeding must work even for an MR that
+				// predates this task's first appearance in the query.
+				s.checkTaskMRState(client, mt.host.ChangeState, mt.task, mt.mrURL)
+				polledCount++
+				processed = true
+			case inChanges:
+				s.checkTaskMRState(client, func(string) (string, error) { return listedState, nil }, mt.task, mt.mrURL)
+				changedCount++
+				processed = true
+			}
+
+			if !processed && !refreshPass {
+				continue // nothing changed, not a refresh pass: skip entirely
+			}
+			if s.checkMRStatesOnceDiscussions(client, mt) {
+				discCount++
 			}
 		}
+		log.Printf("serve: mr watcher: %s incremental: %d changed, %d polled individually, %d discussions fetched", g.projectPath, changedCount, polledCount, discCount)
+	}
+
+	for _, mt := range individual {
+		s.checkMRStatesOnceIndividual(client, mt)
 	}
 }
 

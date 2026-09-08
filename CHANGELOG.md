@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Changed
 
 - Repository restructured into `cmd/tn` (entrypoint) and `internal/tn` (all packages), with `serve.go` split by topic and the web UI bundle embedded from `webui/embed.go`; design documents moved to `docs/design/`. Build with `go build ./cmd/tn`.
+- MR watcher polls GitLab incrementally: MR-bearing tasks routed to the same project are grouped and checked with one `glab api .../merge_requests?updated_after=...` listing call per project per pass, instead of a `glab mr view` call per task — a per-task state/discussions call now only happens for a task the listing reports changed, one never seen before, or (every ~30 minutes) as a periodic full refresh. GitHub polling is unchanged (no incremental listing wired up for it yet). `TN_NO_MRINCREMENTAL=1` reverts to the old one-call-per-task polling for every provider.
 
 ### Fixed
 

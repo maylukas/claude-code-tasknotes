@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.9.0"
+const daemonVersion = "0.9.1"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -312,6 +312,18 @@ type State struct {
 	// notifying, same migration-style dedup convention as MRStates and the
 	// other maps in this struct.
 	MRReviews map[string]mrReviewState `json:"mrReviews"`
+	// MRCursors maps an incremental-polling group key
+	// ("<codeHost.Name()>|<projectPath>", e.g. "gitlab|group/sub/project")
+	// to the newest MR updated_at timestamp observed for that project as of
+	// the last successful ChangedSince call (see incrementalCodeHost,
+	// codehost.go), so the next pass only asks the provider for what
+	// changed since then instead of re-listing the whole project. Only
+	// populated for hosts/tasks that go through the incremental path in
+	// checkMRStatesOnceCore — a host without incrementalCodeHost support
+	// (or TN_NO_MRINCREMENTAL=1) never touches this map at all. Zero value
+	// for an unseen key (time.Time{}) means "list everything", same as an
+	// absent MRStates/MRReviews entry meaning "never observed".
+	MRCursors map[string]time.Time `json:"mrCursors"`
 }
 
 // workerEntry is one declared worker subtask under an owning agent.

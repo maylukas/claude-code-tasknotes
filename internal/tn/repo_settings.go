@@ -237,6 +237,26 @@ type Server struct {
 	// succeeds again.
 	unsupportedHostWarnedOnce map[string]bool
 
+	// mrCursorWarnedOnce is mrWatchWarnedOnce's sibling for the incremental
+	// MR-watcher path's ChangedSince call (see incrementalCodeHost,
+	// checkMRStatesOnceCore): tracks which group keys
+	// ("<codeHost>|<projectPath>") already had a ChangedSince failure
+	// warned about for the CURRENT outage, so a persistently-failing
+	// listing doesn't spam the log every pass while its group falls back to
+	// per-task polling. Cleared per-key the moment that group's
+	// ChangedSince call succeeds again.
+	mrCursorWarnedOnce map[string]bool
+
+	// mrWatchPassCount counts checkMRStatesOnceCore passes (real watcher
+	// ticks and the legacy checkMRStatesOnce test wrapper alike). Used only
+	// to trigger mrReviewRefreshEvery's periodic full discussion refresh
+	// for the incremental path — every task the incremental listing found
+	// unchanged still gets its discussions re-fetched on that cadence,
+	// since resolving a review thread bumps an MR's updated_at on GitLab
+	// but the watcher shouldn't rely on that alone. Guarded by mu, same as
+	// the other simple counters in this struct.
+	mrWatchPassCount int
+
 	// codeHostFunc resolves the codeHost provider for a change-request URL
 	// (see resolveCodeHost in codehost.go). nil (the zero value) means "use
 	// resolveCodeHost" — tests that exercise checkMRStatesOnceReal directly
@@ -345,6 +365,7 @@ func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd st
 		mrWatchWarnedOnce:         map[string]bool{},
 		mrReviewsWarnedOnce:       map[string]bool{},
 		unsupportedHostWarnedOnce: map[string]bool{},
+		mrCursorWarnedOnce:        map[string]bool{},
 		repoSettings:              newRepoSettingsCache(),
 		startedAt:                 time.Now(),
 		seenSinceStart:            map[string]bool{},

@@ -90,7 +90,7 @@ Each runs as its own goroutine, started from `cmdServe`:
 | Stuck session detector | 2m (`stuckCheckInterval`) | tmux pane-scrape for permission prompts; re-prompts a stuck dialog every 15m (`stuckDialogRepromptInterval`) |
 | Sleep detector | 30s (`sleepCheckInterval`) | Detects the host having slept and re-baselines liveness checks |
 | Due-task scanner / webhook-miss reconciler | 10m (`dueScannerInterval`), shared cadence | Picks up recurring tasks and re-routes tasks TaskNotes' webhook missed |
-| MR watcher | 5m (`mrWatchInterval`) | Polls the resolved code-host provider (`glab` or `gh`) for merge/pull-request state transitions |
+| MR watcher | 5m (`mrWatchInterval`) | Polls the resolved code-host provider (`glab` or `gh`) for merge/pull-request state transitions — GitLab tasks are grouped and polled with one incremental `ChangedSince` listing call per project instead of one call per task (`TN_NO_MRINCREMENTAL=1` to disable) |
 | Worktree reaper sweep | 30m default (`worktreeReaperDefaultInterval`), configurable | Removes eligible finished worktrees |
 | Dashboard render debounce | 2s (`dashboardDebounceInterval`) | Coalesces rapid state mutations into one render |
 | SSE heartbeat | 30s (`sseHeartbeatInterval`) | Keeps `/events` connections alive |

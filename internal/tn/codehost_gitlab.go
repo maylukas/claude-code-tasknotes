@@ -12,13 +12,19 @@ import (
 
 // --- GitLab code host provider (glab) ---
 
-// gitlabHost is the codeHost implementation backed by the glab CLI. Zero
-// value only — glab isn't injectable at the process level (unlike
-// githubHost's runner field); existing tests inject at the mrStateFunc /
-// mrDiscussionsFunc level instead (see checkMRStatesOnce's compatibility
-// wrapper in mr_watcher.go), so glabMRState/glabMRDiscussions never
-// exec glab in a test.
-type gitlabHost struct{}
+// gitlabHost is the codeHost implementation backed by the glab CLI.
+// ChangeState and Discussions still call the free-function
+// glabMRState/glabMRDiscussions below directly, not runner — existing
+// tests inject at the mrStateFunc / mrDiscussionsFunc level instead (see
+// checkMRStatesOnce's compatibility wrapper in mr_watcher.go), so those two
+// methods never exec glab in a test regardless of runner. runner exists
+// only for ChangedSince (added for incremental MR-watcher polling — see
+// codehost.go's incrementalCodeHost): nil (the zero value, used by
+// codeHosts/resolveCodeHost) runs the real glab binary via run() below;
+// tests inject a fake there the same way githubHost's runner does.
+type gitlabHost struct {
+	runner func(args ...string) ([]byte, error)
+}
 
 func (gitlabHost) Name() string { return "gitlab" }
 
@@ -35,6 +41,102 @@ func (gitlabHost) ChangeState(changeURL string) (string, error) {
 
 func (gitlabHost) Discussions(changeURL string) (mrDiscussions, error) {
 	return glabMRDiscussions(changeURL)
+}
+
+// projectPathOf extracts the glab "-R" project path from an MR URL — the
+// same value ChangedSince needs to group tasks by project. Thin wrapper
+// around parseMRURL for callers (checkMRStatesOnceCore, via the
+// projectPathHost interface) that only need the project path, not the iid.
+func (gitlabHost) projectPathOf(changeURL string) (string, bool) {
+	project, _, ok := parseMRURL(changeURL)
+	return project, ok
+}
+
+const (
+	// glabMRListPerPage is ChangedSince's per-page size for `glab api
+	// projects/:id/merge_requests`.
+	glabMRListPerPage = 100
+	// glabMRListMaxPages bounds ChangedSince's pagination so a project with
+	// an unusually large number of updated MRs in one window can never make
+	// a single watcher pass block indefinitely — a bounded, possibly
+	// incomplete listing on a pathological project is preferable to an
+	// unbounded one.
+	glabMRListMaxPages = 10
+)
+
+// ChangedSince is incrementalCodeHost's GitLab implementation: `glab api
+// projects/:id/merge_requests?state=all&order_by=updated_at&sort=asc&
+// updated_after=...`, paginated (page= while a full page returns, capped at
+// glabMRListMaxPages). updated_after is set to since minus one second when
+// since is non-zero — GitLab's updated_after filter is inclusive, but its
+// granularity is whole seconds, so without the second of slack an MR
+// updated in the same second as the previous pass's watermark could be
+// silently skipped. newest is computed purely from returned items' own
+// updated_at (never defaulted to since/updated_after), so a call that finds
+// nothing changed reports a zero newest — callers must treat that as "no
+// advance", not regress their cursor to since-1s (see
+// checkMRStatesOnceCore).
+func (h gitlabHost) ChangedSince(projectPath string, since time.Time) (map[string]string, time.Time, error) {
+	apiSince := since
+	if !apiSince.IsZero() {
+		apiSince = apiSince.Add(-time.Second)
+	}
+
+	changes := map[string]string{}
+	var newest time.Time
+	for page := 1; page <= glabMRListMaxPages; page++ {
+		path := fmt.Sprintf("projects/%s/merge_requests?state=all&order_by=updated_at&sort=asc&per_page=%d&page=%d",
+			url.PathEscape(projectPath), glabMRListPerPage, page)
+		if !apiSince.IsZero() {
+			path += "&updated_after=" + url.QueryEscape(apiSince.Format(time.RFC3339))
+		}
+		out, err := h.run("api", path)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		var items []struct {
+			WebURL    string `json:"web_url"`
+			State     string `json:"state"`
+			UpdatedAt string `json:"updated_at"`
+		}
+		if err := json.Unmarshal(out, &items); err != nil {
+			return nil, time.Time{}, err
+		}
+		if len(items) == 0 {
+			break
+		}
+		for _, mr := range items {
+			state := mr.State
+			if state == "locked" {
+				state = "opened" // see gitlabHost.Discussions/glabMRState's own treatment elsewhere
+			}
+			changes[mr.WebURL] = state
+			if t, err := time.Parse(time.RFC3339, mr.UpdatedAt); err == nil && t.After(newest) {
+				newest = t
+			}
+		}
+		if len(items) < glabMRListPerPage {
+			break
+		}
+	}
+	return changes, newest, nil
+}
+
+// run shells out to `glab <args>` (or calls h.runner, when injected for
+// tests) and returns its stdout. Same HOME/env handling as glabMRState/
+// runGlabAPI, for the same launchd reason. Used only by ChangedSince today
+// — see the gitlabHost struct doc comment for why ChangeState/Discussions
+// don't go through it.
+func (h gitlabHost) run(args ...string) ([]byte, error) {
+	if h.runner != nil {
+		return h.runner(args...)
+	}
+	cmd := exec.Command(resolveGlabBin(), args...)
+	cmd.Env = os.Environ()
+	if home, err := os.UserHomeDir(); err == nil {
+		cmd.Env = append(cmd.Env, "HOME="+home)
+	}
+	return cmd.Output()
 }
 
 // parseMRURL extracts glab's "-R" project path (group/subgroup/.../project

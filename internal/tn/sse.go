@@ -127,6 +127,7 @@ func loadState(path string) *State {
 		DoneMeansNoted:      map[string]bool{},
 		PermissionDenials:   map[string]*permissionDenialRecord{},
 		MRReviews:           map[string]mrReviewState{},
+		MRCursors:           map[string]time.Time{},
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -179,6 +180,9 @@ func loadState(path string) *State {
 	}
 	if st.MRReviews == nil {
 		st.MRReviews = map[string]mrReviewState{}
+	}
+	if st.MRCursors == nil {
+		st.MRCursors = map[string]time.Time{}
 	}
 	return st
 }
