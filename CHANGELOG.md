@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Changed
 
+- Repository restructured into `cmd/tn` (entrypoint) and `internal/tn` (all packages), with `serve.go` split by topic and the web UI bundle embedded from `webui/embed.go`; design documents moved to `docs/design/`. Build with `go build ./cmd/tn`.
+
 ### Fixed
 
 ## [0.7.0] - 2026-09-08

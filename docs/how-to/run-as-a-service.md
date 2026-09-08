@@ -113,7 +113,7 @@ A successful `codesign`/`go build` does not guarantee the running process picked
 curl -s localhost:8391/status | python3 -c 'import json,sys; d=json.load(sys.stdin)["daemon"]; print(d["version"], d["uptime"])'
 ```
 
-Compare the printed version against the `daemonVersion` constant in `serve.go` you just built, and the uptime against how long ago you actually built. If they don't match what you expect, the old process is still serving:
+Compare the printed version against the `daemonVersion` constant in `internal/tn/serve.go` you just built, and the uptime against how long ago you actually built. If they don't match what you expect, the old process is still serving:
 
 ```bash
 launchctl kickstart -k gui/$UID/com.example.tn-serve

@@ -42,7 +42,7 @@ Most read commands (`list`, `get`, `agents`, `env`, `repo`, `inbox`, `msg`) acce
 
 ## Task commands
 
-These talk to the TaskNotes HTTP API (`api.go`), mostly via a GET-then-PUT round trip so that structured note blocks (history, ask, brief, links) are preserved on write. See [note-layout.md](note-layout.md) for the full body-block format.
+These talk to the TaskNotes HTTP API (`internal/tn/api.go`), mostly via a GET-then-PUT round trip so that structured note blocks (history, ask, brief, links) are preserved on write. See [note-layout.md](note-layout.md) for the full body-block format.
 
 ### `tn health`
 
@@ -306,7 +306,7 @@ $ tn link tasks/fix-login-bug.md https://github.com/example/myapp/pull/42 --labe
 
 ## Bridge commands
 
-These talk to the `tn serve` daemon (`bridge.go`), not the TaskNotes API directly. Most fail with a clear "bridge not reachable" message if the daemon isn't running.
+These talk to the `tn serve` daemon (`internal/tn/bridge.go`), not the TaskNotes API directly. Most fail with a clear "bridge not reachable" message if the daemon isn't running.
 
 ### `tn serve`
 

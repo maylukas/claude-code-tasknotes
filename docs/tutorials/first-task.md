@@ -15,7 +15,7 @@ Walk through creating a TaskNotes task that spawns a Claude Code orchestrator, w
 ```bash
 git clone <this-repo-url> tasknotes-cli
 cd tasknotes-cli
-go build -o ~/bin/tn .
+go build -o ~/bin/tn ./cmd/tn
 ```
 
 Make sure `~/bin` is on your `PATH`. Confirm the binary runs:

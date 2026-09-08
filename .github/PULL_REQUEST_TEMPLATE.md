@@ -9,7 +9,7 @@
 - [ ] Updated relevant documentation (`docs/`, `README.md`, `ARCHITECTURE.md`)
 - [ ] Added an entry under `## [Unreleased]` in `CHANGELOG.md`
 - [ ] If `webui/src` changed: ran `pnpm build` and committed the resulting `webui/dist/` changes
-- [ ] If daemon behavior changed (new endpoint, changed `/status`/`/health` shape, other observable behavior): bumped `daemonVersion` in `serve.go`
+- [ ] If daemon behavior changed (new endpoint, changed `/status`/`/health` shape, other observable behavior): bumped `daemonVersion` in `internal/tn/serve.go`
 
 ## How was this verified?
 

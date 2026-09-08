@@ -74,8 +74,9 @@ Background and design rationale. No step-by-step instructions here.
 
 ### Historical design documents
 
-The `SPEC-*.md` files at the repository root (`SPEC-serve.md`, `SPEC-dashboard.md`,
-`SPEC-generations.md`, `SPEC-note-layout.md`, `SPEC-ui-v2.md`, `SPEC-obsidian-plugin.md`)
+The `SPEC-*.md` files in [`docs/design/`](design/) (`SPEC-serve.md`, `SPEC-dashboard.md`,
+`SPEC-generations.md`, `SPEC-note-layout.md`, `SPEC-ui-v2.md`, `SPEC-obsidian-plugin.md`,
+`IMPLEMENTATION-PLAN-REMOTE-EXECUTION.md`)
 are the original implementation specs written as the system was built. They're partly
 stale relative to the code, but useful as design history. See
 [Design history](explanation/design-history.md) for context on how to read them.

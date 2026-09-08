@@ -12,12 +12,12 @@ Install [TaskNotes](https://github.com/callumalpass/tasknotes) as an Obsidian co
 
 In TaskNotes' settings, open the **HTTP API** tab and turn it on. You'll set a port there.
 
-TaskNotes' own default port is `8080`, but `tn`'s default (`resolveConfig` in `api.go`) is `8390`. Pick one of two approaches:
+TaskNotes' own default port is `8080`, but `tn`'s default (`resolveConfig` in `internal/tn/api.go`) is `8390`. Pick one of two approaches:
 
 - Set TaskNotes' HTTP API port to `8390` so `tn`'s built-in default just works, or
 - Leave TaskNotes on whatever port you prefer and put that port in `~/.config/tn/config.json`'s `url` field instead (see [Reference: configuration](../reference/configuration.md)).
 
-TaskNotes also lets you set an authentication token for the API. It's optional on TaskNotes' side, but recommended: `tn` always sends it as `Authorization: Bearer <token>` when one is configured (`api.go`'s `request()`), and without a token the API accepts unauthenticated requests from anything on your machine.
+TaskNotes also lets you set an authentication token for the API. It's optional on TaskNotes' side, but recommended: `tn` always sends it as `Authorization: Bearer <token>` when one is configured (`internal/tn/api.go`'s `request()`), and without a token the API accepts unauthenticated requests from anything on your machine.
 
 Restart Obsidian after enabling the HTTP API for the setting to take effect.
 

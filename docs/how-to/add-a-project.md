@@ -30,7 +30,7 @@ Other optional keys on a project entry:
 |---|---|
 | `autoSpawn` | Whether the daemon may spawn an orchestrator for this project at all. |
 | `cwd` | Working directory the orchestrator's tmux session starts in. |
-| `env` | Per-project environment variables injected into the spawn command; see the doc comment on `EnvEntry` in `serve.go` for the injected-vs-advisory distinction. |
+| `env` | Per-project environment variables injected into the spawn command; see the doc comment on `EnvEntry` in `internal/tn/serve.go` for the injected-vs-advisory distinction. |
 | `jiraStatusMap` | Optional Jira workflow status names per TaskNotes status; see [Jira integration](jira-integration.md). |
 
 ## 2. Reload the daemon
@@ -38,7 +38,7 @@ Other optional keys on a project entry:
 `serve.json` is only read at startup. Two ways to pick up the change:
 
 - Restart `tn serve` directly (`Ctrl-C` then re-run it, or `launchctl kickstart -k gui/$UID/com.example.tn-serve` if you're running it as a service; see [Run tn serve as a service](run-as-a-service.md)).
-- If the self-restart watcher is enabled (the default; it's off only when `TN_NO_SELFRESTART=1` is set), touch the binary: `touch ~/bin/tn`. The watcher (`watchBinaryForSelfRestart` in `serve.go`) polls the binary's mtime/size every 10 seconds and exits the process the moment it changes, so a launchd `KeepAlive` supervisor brings it back up within about 10 seconds, re-reading `serve.json` on the new process's startup. A stat error only counts as "changed" after several consecutive failures, so a `go build -o` in-progress rename doesn't trigger a spurious restart.
+- If the self-restart watcher is enabled (the default; it's off only when `TN_NO_SELFRESTART=1` is set), touch the binary: `touch ~/bin/tn`. The watcher (`watchBinaryForSelfRestart` in `internal/tn/selfrestart.go`) polls the binary's mtime/size every 10 seconds and exits the process the moment it changes, so a launchd `KeepAlive` supervisor brings it back up within about 10 seconds, re-reading `serve.json` on the new process's startup. A stat error only counts as "changed" after several consecutive failures, so a `go build -o` in-progress rename doesn't trigger a spurious restart.
 
 Either way, confirm the reload happened by tailing the log (`~/Library/Logs/tn-serve.log` if you followed the service how-to, or the terminal it's running in otherwise) for a fresh startup sequence.
 

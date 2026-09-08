@@ -9,7 +9,7 @@ webhooks, tmux orchestrator spawning, and a dashboard note rendered into the vau
 
 ```bash
 gofmt -l . && go vet ./... && go test ./... && go test -race ./...   # must all be clean before handing off
-go build -o ~/bin/tn . && codesign -s "Apple Development: Your Name (TEAMID)" -f --identifier com.example.tn ~/bin/tn
+go build -o ~/bin/tn ./cmd/tn && codesign -s "Apple Development: Your Name (TEAMID)" -f --identifier com.example.tn ~/bin/tn
 # ALWAYS sign after building: the daemon shows macOS dialogs via osascript, and TCC
 # keys its Apple-Events approval on the code identity — an unsigned rebuild changes
 # identity every time and re-triggers "tn would like to access data from other apps"
@@ -33,8 +33,8 @@ go build -o ~/bin/tn . && codesign -s "Apple Development: Your Name (TEAMID)" -f
 `go build`:**
 
 ```bash
-cd webui && pnpm build   # emits webui/dist/, which serve.go embeds via `//go:embed all:webui/dist`
-cd .. && go build -o ~/bin/tn .   # picks up whatever is currently in webui/dist/ — see below
+cd webui && pnpm build   # emits webui/dist/, which webui/embed.go embeds via `//go:embed all:dist`
+cd .. && go build -o ~/bin/tn ./cmd/tn   # picks up whatever is currently in webui/dist/ — see below
 ```
 
 - **The footgun**: `go build` embeds whatever bytes are on disk in `webui/dist/` at
@@ -44,7 +44,7 @@ cd .. && go build -o ~/bin/tn .   # picks up whatever is currently in webui/dist
   zero warning. There is no version check tying the two together. If `GET /ui` looks
   wrong after a webui/ change, this is the first thing to check.
   - Mitigated, not eliminated: `/status.daemon.buildHash` is a hash of the actually-
-    embedded bundle bytes (`serve.go`'s `computeWebUIBuildHash`), rendered in the UI's
+    embedded bundle bytes (`internal/tn/ui.go`'s `computeWebUIBuildHash`), rendered in the UI's
     own footer. Compare it against a fresh `pnpm build` if you suspect staleness — a
     mismatch confirms it instantly. If `webui/dist/` has *some* files but isn't a real
     Vite build (no `assets/` dir), `GET /ui` serves a loud "run pnpm build" page instead
@@ -70,21 +70,23 @@ cd .. && go build -o ~/bin/tn .   # picks up whatever is currently in webui/dist
 
 | File | Contents |
 |---|---|
-| `api.go` | TaskNotes API client (config resolve, task CRUD, query, webhooks list/create) |
-| `main.go` | CLI dispatch + usage text |
-| `serve.go` | Bridge daemon: state, HTTP handlers, webhook routing, spawn, dashboard, self-restart |
-| `bridge.go` | Bridge client (register/inbox/ack/send/agents subcommands) |
-| `note_layout.go` | Structured task-note body layout (ask/brief/description/history blocks, migration) — see SPEC-note-layout.md |
-| `reaper.go` | Worktree reaper: removes finished `.claude/worktrees/agent-*` worktrees when clean + pushed + unlocked + old enough (never `--force`, branch `-d` only when merged), `/status.worktrees`, `POST /worktrees/reap`, `tn worktrees` — see SPEC-serve.md "Worktree reaper". Tests build real temp git repos |
-| `creds.go` | claude.ai credential profiles: Keychain abstraction (`keychainStore`, real impl shells out to `/usr/bin/security`), profile save/list/use/rm, usage-limit auto-swap + parked-pane nudge, `GET /creds` / `POST /creds/swap`, `tn creds` CLI — see SPEC-serve.md "Credential profiles & auto-swap". Tests inject a fake keychain; never call `security` |
-| `*_test.go` | See conventions above |
-| `webui/` | React + TanStack Router + shadcn/ui SPA (TypeScript, Vite) — `GET /ui`'s content. Own toolchain, own build step (`pnpm build`), never a Go dependency — see Build/test above |
-| `obsidian-plugin/` | Thin Obsidian plugin: an iframe pointed at the daemon's own `/ui`, plus a postMessage bridge for opening vault notes and syncing Obsidian's theme into the iframe — see SPEC-ui-v2.md |
-| `SPEC-serve.md`, `SPEC-dashboard.md`, `SPEC-generations.md`, `SPEC-note-layout.md`, `SPEC-ui-v2.md` | Implementation specs (history; code is source of truth) |
+| `cmd/tn/main.go` | Entrypoint (package `main`): calls `tn.Run` |
+| `internal/tn/api.go` | TaskNotes API client (config resolve, task CRUD, query, webhooks list/create) |
+| `internal/tn/main.go` | CLI dispatch + usage text (package `tn`) |
+| `internal/tn/serve.go` | Daemon state model, `Server` type, config resolution, entrypoint (`newMux`, `cmdServe`) |
+| `internal/tn/{handlers,orphans,stranded,sleep,workers,feed,status,ui,webhook,due_scanner,mr_watcher,webhook_reconciler,spawn,spawn_reconciler,debounce,stuck,needs_action,dashboard,session_pages,selfrestart,sse,repo_settings}.go` | The rest of the daemon, split by topic (HTTP handlers, webhook routing, spawn/reconcile, stuck-session detection, dashboard rendering, self-restart, etc.) — see `ARCHITECTURE.md`'s code map for the one-line purpose of each |
+| `internal/tn/bridge.go` | Bridge client (register/inbox/ack/send/agents subcommands) |
+| `internal/tn/note_layout.go` | Structured task-note body layout (ask/brief/description/history blocks, migration) — see `docs/design/SPEC-note-layout.md` |
+| `internal/tn/reaper.go` | Worktree reaper: removes finished `.claude/worktrees/agent-*` worktrees when clean + pushed + unlocked + old enough (never `--force`, branch `-d` only when merged), `/status.worktrees`, `POST /worktrees/reap`, `tn worktrees` — see `docs/design/SPEC-serve.md` "Worktree reaper". Tests build real temp git repos |
+| `internal/tn/creds.go` | claude.ai credential profiles: Keychain abstraction (`keychainStore`, real impl shells out to `/usr/bin/security`), profile save/list/use/rm, usage-limit auto-swap + parked-pane nudge, `GET /creds` / `POST /creds/swap`, `tn creds` CLI — see `docs/design/SPEC-serve.md` "Credential profiles & auto-swap". Tests inject a fake keychain; never call `security` |
+| `internal/tn/*_test.go` | See conventions above |
+| `webui/` | React + TanStack Router + shadcn/ui SPA (TypeScript, Vite) — `GET /ui`'s content. Own toolchain, own build step (`pnpm build`), never a Go dependency. `webui/embed.go` (package `webui`) exports `Dist embed.FS` (`//go:embed all:dist`), imported by `internal/tn/ui.go` — see Build/test above |
+| `obsidian-plugin/` | Thin Obsidian plugin: an iframe pointed at the daemon's own `/ui`, plus a postMessage bridge for opening vault notes and syncing Obsidian's theme into the iframe — see `docs/design/SPEC-ui-v2.md` |
+| `docs/design/SPEC-serve.md`, `docs/design/SPEC-dashboard.md`, `docs/design/SPEC-generations.md`, `docs/design/SPEC-note-layout.md`, `docs/design/SPEC-ui-v2.md`, `docs/design/SPEC-obsidian-plugin.md`, `docs/design/IMPLEMENTATION-PLAN-REMOTE-EXECUTION.md` | Implementation specs (history; code is source of truth) |
 | `ORCHESTRATOR.md` | Operating contract read by daemon-spawned headless sessions |
 | `skills/tasknotes/` | Claude skill, exposed via this repo being a plugin |
 | `.claude-plugin/` | Plugin + local-marketplace manifests (marketplace `tasknotes-local`, user-scope install) |
-| `hooks/claude-hook.sh` | Claude Code `PermissionRequest`/`PermissionDenied` hook script — one script for both events, user-installed into their own `~/.claude/settings.json` (never written by the daemon), POSTs to `POST /hooks/permission-request` or `/hooks/permission-denied` — see SPEC-serve.md's "PermissionRequest hook detection" section |
+| `hooks/claude-hook.sh` | Claude Code `PermissionRequest`/`PermissionDenied` hook script — one script for both events, user-installed into their own `~/.claude/settings.json` (never written by the daemon), POSTs to `POST /hooks/permission-request` or `/hooks/permission-denied` — see `docs/design/SPEC-serve.md`'s "PermissionRequest hook detection" section |
 
 ## Runtime layout (this machine)
 

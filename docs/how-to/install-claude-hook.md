@@ -23,7 +23,7 @@ if [ -z "${TN_AGENT_NAME:-}" ]; then
 fi
 ```
 
-`TN_AGENT_NAME` is set by the daemon (`buildLaunchCommand` in `serve.go`) as a literal environment-variable prefix on the exact shell command it types into a spawned orchestrator's tmux pane. An ordinary interactive Claude Code session run directly by a human has no `TN_AGENT_NAME` at all, so this script is a silent no-op for it. **This is what makes a global install (below) safe.**
+`TN_AGENT_NAME` is set by the daemon (`buildLaunchCommand` in `internal/tn/spawn.go`) as a literal environment-variable prefix on the exact shell command it types into a spawned orchestrator's tmux pane. An ordinary interactive Claude Code session run directly by a human has no `TN_AGENT_NAME` at all, so this script is a silent no-op for it. **This is what makes a global install (below) safe.**
 
 ## Install
 

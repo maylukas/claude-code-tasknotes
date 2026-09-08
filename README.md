@@ -75,7 +75,7 @@ Build from source:
 ```bash
 git clone https://github.com/maylukas/claude-code-tasknotes.git
 cd claude-code-tasknotes
-go build -o ~/bin/tn .
+go build -o ~/bin/tn ./cmd/tn
 ```
 
 Make sure `~/bin` is on your `PATH`. The module path in `go.mod` (`tasknotes-cli`) has no host prefix, so `go install` from a remote import path isn't available until the module is published under one; build from a local clone instead.

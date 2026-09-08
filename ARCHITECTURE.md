@@ -4,70 +4,68 @@ A codemap for `tasknotes-cli`: what lives where, and why, so you can find the ri
 
 ## Bird's-eye view
 
-Everything ships as one Go binary, `tn`, built from a flat package `main` at the repo root (no internal packages, stdlib only). The binary does two unrelated-looking jobs from the same codebase:
+Everything ships as one Go binary, `tn`. A thin `cmd/tn` entrypoint (package `main`) calls into `internal/tn` (package `tn`), which holds all the logic; stdlib only, no third-party Go modules. The binary does two unrelated-looking jobs from the same codebase:
 
-1. **CLI**: a thin wrapper around the TaskNotes Obsidian plugin's HTTP API (`api.go`), invoked as `tn <command>`.
+1. **CLI**: a thin wrapper around the TaskNotes Obsidian plugin's HTTP API (`internal/tn/api.go`), invoked as `tn <command>`.
 2. **Daemon**: `tn serve` runs an HTTP server on `127.0.0.1:8391` that bridges TaskNotes webhooks to Claude Code agent sessions running in tmux, plus a handful of background loops (spawn reconciliation, stuck-session detection, due-task scanning, an MR watcher, and more).
 
-These two jobs share the `Task`/`Client` types in `api.go` and the structured note-body logic in `note_layout.go`, but otherwise `main.go`'s CLI dispatch and `serve.go`'s HTTP handlers are independent code paths. Two satellite subtrees, `webui/` (a React SPA embedded into the daemon at `GET /ui`) and `obsidian-plugin/` (a thin Obsidian panel that iframes it), have their own toolchains and are never Go dependencies.
+These two jobs share the `Task`/`Client` types in `api.go` and the structured note-body logic in `note_layout.go`, but otherwise `main.go`'s CLI dispatch and the daemon's HTTP handlers are independent code paths. Two satellite subtrees, `webui/` (a React SPA embedded into the daemon at `GET /ui` via `webui/embed.go`) and `obsidian-plugin/` (a thin Obsidian panel that iframes it), have their own toolchains and are never Go dependencies of `internal/tn` — the daemon imports the small `tasknotes-cli/webui` package and serves its exported `webui.Dist` (an `embed.FS`).
 
-## Single-binary layout
+## Repository layout
 
 ```text
-main.go          CLI dispatch (flag parsing, command table, usage text)
-api.go           TaskNotes HTTP API client: config resolve, task CRUD, query, webhooks
-bridge.go        Bridge client: register/inbox/ack/send/agents subcommands (talks to serve.go)
-note_layout.go   Structured task-note body (ask/brief/description/history/reply/links blocks)
-serve.go         The daemon: state, HTTP handlers, webhook routing, spawn, dashboard, background loops
-creds.go         Credential-profile capture/list/swap (Keychain-backed)
-reaper.go        Worktree reaper: safe cleanup of finished agent git worktrees
-webui/           React + TanStack Router + shadcn/ui SPA, served at GET /ui, own pnpm build step
-obsidian-plugin/ Thin ItemView: an iframe pointed at the daemon's own /ui, plus a postMessage bridge
+cmd/tn/main.go        entrypoint (package main): calls tn.Run and nothing else
+internal/tn/          package tn — all CLI and daemon logic (see code map below)
+webui/                React + TanStack Router + shadcn/ui SPA, served at GET /ui, own pnpm build step
+  embed.go            package webui: `Dist embed.FS` (`//go:embed all:dist`), imported by internal/tn
+obsidian-plugin/       Thin ItemView: an iframe pointed at the daemon's own /ui, plus a postMessage bridge
+hooks/                 Claude Code PermissionRequest/PermissionDenied hook script
+skills/                Claude skill, exposed via this repo being a plugin
+docs/                  Diátaxis documentation; docs/design/ holds the historical SPEC-*.md / IMPLEMENTATION-PLAN-*.md records
 ```
 
-## Code map: what's in each file
+## Code map: `internal/tn`
 
-| File | Lines | Contents |
-|---|---|---|
-| `main.go` | ~860 | `usage` text (the authoritative CLI synopsis), `run()`'s command dispatch table, and one `cmd*` function per subcommand |
-| `api.go` | ~530 | `Task`/`Client` types, `resolveConfig` (env/config.json/defaults), task CRUD (`CreateTask`, `UpdateTask`, `GetTask`, `QueryTasks`), webhook list/create |
-| `bridge.go` | ~750 | `resolveBridgeURL`, the bridge HTTP client, and the CLI-side implementation of `register`/`drain`/`retire`/`inbox`/`ack`/`send`/`agents`/`log`/`env`/`repo` |
-| `note_layout.go` | ~550 | `noteBody` parse/render/migrate (pure functions, no I/O), `checkDoneMeans` (the DONE MEANS evidence gate) |
-| `creds.go` | ~1030 | `keychainStore` interface + macOS `security`-backed implementation, `credsStore` (profile capture/list/use), `handleCredsList`/`handleCredsSwap`, auto-swap on a detected usage limit |
-| `reaper.go` | ~890 | `worktreeReaper`: eligibility rules (unlocked, aged past `minAge`, clean, HEAD pushed), `tn worktrees` CLI, background sweep |
-| `serve.go` | ~9930 | The daemon: see the region breakdown below |
+| File | Contents |
+|---|---|
+| `main.go` | `usage` text (the authoritative CLI synopsis), `Run()`'s command dispatch table, and one `cmd*` function per subcommand |
+| `api.go` | `Task`/`Client` types, `resolveConfig` (env/config.json/defaults), task CRUD (`CreateTask`, `UpdateTask`, `GetTask`, `QueryTasks`), webhook list/create |
+| `bridge.go` | `resolveBridgeURL`, the bridge HTTP client, and the CLI-side implementation of `register`/`drain`/`retire`/`inbox`/`ack`/`send`/`agents`/`log`/`env`/`repo` |
+| `note_layout.go` | `noteBody` parse/render/migrate (pure functions, no I/O), `checkDoneMeans` (the DONE MEANS evidence gate) |
+| `creds.go` | `keychainStore` interface + macOS `security`-backed implementation, `credsStore` (profile capture/list/use), `handleCredsList`/`handleCredsSwap`, auto-swap on a detected usage limit |
+| `reaper.go` | `worktreeReaper`: eligibility rules (unlocked, aged past `minAge`, clean, HEAD pushed), `tn worktrees` CLI, background sweep |
 
-### `serve.go` region breakdown
+### The daemon, split by topic
 
-`serve.go` is one file by deliberate choice (see [design history](docs/explanation/design-history.md)), but it's organized into commented regions. Approximate line numbers as of this writing; search for the marker comment rather than trusting the number if the file has moved on:
+The daemon used to be one large `serve.go` (see [design history](docs/explanation/design-history.md) for why it was written that way); it's now split into topical files, still all in package `tn` alongside the files above:
 
-| Region | Around line | What it does |
-|---|---|---|
-| State model (`State`, `Agent`, `Message`, `ServeConfig`, `ProjectConfig`) | 40-560 | Persisted structs, see [data structures](#key-data-structures) below |
-| Repo-note parallelism settings | 413 | `repoSettingsFor`: live 60s-cached read of a project's `max-orchestrators`/`max-workers` |
-| SSE (`GET /events`) | 766 | Server-sent events for the web UI |
-| HTTP handlers (register/drain/retire/context/approve, inbox/ack/messages) | 1473+ | Core agent-registry and messaging endpoints |
-| Orphaned-task safety net | 1836 | Detects a dead agent's in-progress tasks and resets them to open |
-| Stranded-message sweep | 2179 | Reassigns or archives messages addressed to a confirmed-dead agent |
-| Host sleep detection & self-heal | 2486 | Recovers liveness bookkeeping after the machine sleeps |
-| Worker visibility (`tn worker start|end`) | 2995 | Declares/retracts a worker subtask for `/status` |
-| Feed + reply (`GET /feed`, `POST /reply`) | 3080 | Session activity feed and the human-reply endpoint |
-| Status endpoint (tray-app foundation) | 4028, handler at 4759 | `GET /status` aggregate JSON |
-| UI v2: embedded React SPA | 4840 | `GET /ui` serves `webui/dist` via `go:embed` |
-| TaskNotes webhook handling | 4980 | `handleTaskNotesWebhook`, routing, `@claude:` line extraction |
-| Webhook self-registration | 6021 | Registers the daemon's own webhook URL with TaskNotes on startup |
-| Due-task scanner | 6107, `startDueTaskScanner` at 6255 | Picks up recurring/scheduled tasks that came due without a webhook |
-| MR watcher | 6364, `startMRWatcher` at 6469 | Polls `glab` for merge request state on tasks carrying an MR URL |
-| Webhook-miss reconciler | 6640 | Re-routes tasks modified while the daemon was briefly down |
-| Orchestrator startup | 7274, `spawnOrchestratorSession` at 7393 | Builds the launch command, starts/reuses a tmux session |
-| Spawn reconciler | 7484, `startSpawnReconciler` at 7497 | Retries failed spawns, scales out additional generations |
-| Debounce | 7662 | Dashboard-render coalescing |
-| Stuck session detection | 7713, `startStuckDetector` at 8395 | Pane-scraping + hook-based permission-prompt detection, macOS dialogs |
-| Needs-your-action (dashboard section) | 8979 | Live TaskNotes query for triage/needs-input/review tasks |
-| Dashboard rendering | 9120, `renderDashboardMarkdown` at 9400 | Renders `Claude Sessions.md` |
-| Per-session activity pages | 9469 | One page per agent under `sessionPagesDir` |
-| Self-restart on binary change | 9670, `watchBinaryForSelfRestart` at 9706 | Exits when `~/bin/tn`'s bytes change, so launchd restarts it |
-| Config / entrypoint | 9765, `newMux` at 9841 | `resolveServeConfig`, the full route table, `cmdServe` |
+| File | What it does |
+|---|---|
+| `serve.go` | State model (`State`, `Agent`, `Message`, `ServeConfig`, `ProjectConfig` — see [data structures](#key-data-structures) below), the `Server` type, config resolution, and the entrypoint (`newMux`, `cmdServe`) |
+| `repo_settings.go` | `repoSettingsFor`: live 60s-cached read of a project's `max-orchestrators`/`max-workers` from its repo note |
+| `sse.go` | Server-sent events (`GET /events`) for the web UI |
+| `handlers.go` | Core agent-registry and messaging HTTP handlers: register/drain/retire/context/approve, inbox/ack/messages |
+| `orphans.go` | Orphaned-task safety net: detects a dead agent's in-progress tasks and resets them to open |
+| `stranded.go` | Stranded-message sweep: reassigns or archives messages addressed to a confirmed-dead agent |
+| `sleep.go` | Host sleep detection and self-heal: recovers liveness bookkeeping after the machine sleeps |
+| `workers.go` | Worker visibility (`tn worker start|end`): declares/retracts a worker subtask for `/status` |
+| `feed.go` | Session activity feed and the human-reply endpoint (`GET /feed`, `POST /reply`) |
+| `status.go` | `GET /status` aggregate JSON (tray-app foundation) |
+| `ui.go` | `GET /ui`: serves the embedded `webui.Dist` bundle |
+| `webhook.go` | TaskNotes webhook handling (`handleTaskNotesWebhook`, routing, `@claude:` line extraction) and the daemon's own webhook self-registration with TaskNotes on startup |
+| `due_scanner.go` | Due-task scanner: picks up recurring/scheduled tasks that came due without a webhook |
+| `mr_watcher.go` | Polls `glab` for merge request state on tasks carrying an MR URL |
+| `webhook_reconciler.go` | Webhook-miss reconciler: re-routes tasks modified while the daemon was briefly down |
+| `spawn.go` | Orchestrator startup: builds the launch command, starts/reuses a tmux session |
+| `spawn_reconciler.go` | Spawn reconciler: retries failed spawns, scales out additional generations |
+| `debounce.go` | Dashboard-render coalescing |
+| `stuck.go` | Stuck session detection: pane-scraping + hook-based permission-prompt detection, macOS dialogs |
+| `needs_action.go` | Needs-your-action dashboard section: live TaskNotes query for triage/needs-input/review tasks |
+| `dashboard.go` | Dashboard rendering: `renderDashboardMarkdown`, writes `Claude Sessions.md` |
+| `session_pages.go` | Per-session activity pages: one page per agent under `sessionPagesDir` |
+| `selfrestart.go` | Self-restart on binary change: exits when `~/bin/tn`'s bytes change, so launchd restarts it |
+
+Plus one `*_test.go` file per file above (see [testing conventions](#testing-conventions) below).
 
 ## Key data structures
 
@@ -104,13 +102,13 @@ Agent liveness itself isn't a loop: it's derived from `aliveWindow` (90s) agains
 - **Tests never touch tmux, the real vault, or the Keychain.** Every side effect that would is injected as a function value and faked in tests: `spawnFunc`, `captureFunc`, `dialogFunc`, `sendKeysFunc`, `keychainStore`, `gitRunFunc` (and the `tmuxHasSessionFunc`/`tmuxListPanesFunc`/`tmuxKillSessionFunc`/`tmuxNewSessionFunc` family). Functional smoke runs use explicit high ports (18xxx) and a scratch `$HOME`/dashboard path.
 - **All state and dashboard writes are atomic**, via `atomicWriteFile` (write to a temp file, then rename). Obsidian and other readers must never see a partially-written file.
 - **`webui/dist/` is committed, not gitignored.** A fresh checkout can `go build` immediately without Node/pnpm; `pnpm build` is only needed after touching `webui/src/`. `go build` embeds whatever bytes are currently on disk in `webui/dist/` with no check against `webui/src/`; see the "footgun" note in `CLAUDE.md`'s build/test section if the served UI ever looks stale.
-- **External binaries are resolved, never assumed**: `resolveTmuxBin`, `resolveGlabBin`, and `resolveGitBin` (serve.go, reaper.go) try the usual Homebrew and system locations before falling back to `$PATH`, because launchd's environment has no Homebrew on `PATH`. The operating contract `ORCHESTRATOR.md` is located by `resolveOrchestratorDoc` (env `TN_ORCHESTRATOR_DOC`, `serve.json` `orchestratorDoc`, `~/.config/tn/`, next to the binary, cwd) and logged at startup.
+- **External binaries are resolved, never assumed**: `resolveTmuxBin`, `resolveGlabBin`, and `resolveGitBin` (`internal/tn/serve.go`, `internal/tn/reaper.go`) try the usual Homebrew and system locations before falling back to `$PATH`, because launchd's environment has no Homebrew on `PATH`. The operating contract `ORCHESTRATOR.md` is located by `resolveOrchestratorDoc` (env `TN_ORCHESTRATOR_DOC`, `serve.json` `orchestratorDoc`, `~/.config/tn/`, next to the binary, cwd) and logged at startup.
 
 ## `webui/` and `obsidian-plugin/`
 
-`webui/` is a React + TypeScript SPA built with Vite, using TanStack Router and shadcn/ui, that renders `GET /ui`'s content: the dashboard, session views, and status page a human actually looks at. It has its own `package.json`/`pnpm-lock.yaml` and is never a Go module dependency; `pnpm build` emits `webui/dist/`, which `serve.go` embeds wholesale via `//go:embed all:webui/dist`.
+`webui/` is a React + TypeScript SPA built with Vite, using TanStack Router and shadcn/ui, that renders `GET /ui`'s content: the dashboard, session views, and status page a human actually looks at. It has its own `package.json`/`pnpm-lock.yaml` and is never a Go module dependency of `internal/tn`; `pnpm build` emits `webui/dist/`, which `webui/embed.go` (package `webui`, `//go:embed all:dist`) exposes as `Dist embed.FS`, imported and served by `internal/tn/ui.go`.
 
-`obsidian-plugin/` is deliberately small: an `ItemView` containing an `<iframe src="http://localhost:8391/ui?host=obsidian">` and a `postMessage` bridge for the one thing an iframe can't do on its own, opening a vault note or syncing Obsidian's active theme into the embedded page. It supersedes an earlier design (see `SPEC-obsidian-plugin.md`) where the plugin rendered its own DOM directly from polled JSON; that approach is documented for history but the daemon-owned-UI shape in `SPEC-ui-v2.md` is what's actually built.
+`obsidian-plugin/` is deliberately small: an `ItemView` containing an `<iframe src="http://localhost:8391/ui?host=obsidian">` and a `postMessage` bridge for the one thing an iframe can't do on its own, opening a vault note or syncing Obsidian's active theme into the embedded page. It supersedes an earlier design (see `docs/design/SPEC-obsidian-plugin.md`) where the plugin rendered its own DOM directly from polled JSON; that approach is documented for history but the daemon-owned-UI shape in `docs/design/SPEC-ui-v2.md` is what's actually built.
 
 ## Data flow: one webhook to one routed message
 
@@ -127,18 +125,18 @@ See `docs/explanation/lifecycle-of-a-task.md` for the full walk, including the `
 
 ## Testing conventions
 
-Every `*_test.go` file (there's one per major subsystem: `serve_test.go`, `stuck_detector_test.go`, `creds_test.go`, `reaper_test.go`, and so on, all at the repo root alongside the code they test, no `internal/` split) builds a `Server`/`Client` via `httptest` and the same injected-function seams described above, never a real daemon, tmux session, or vault. `go test -race ./...` is not optional: the project's own history records two real concurrency bugs (a `*Message` JSON-encoded outside its lock while a concurrent inbox poll mutated it, and an unsynchronized slice in a debouncer test) that only `-race` caught, on first use. A change to `serve.go` is not done until `gofmt -l .`, `go vet ./...`, `go test ./...`, and `go test -race ./...` are all clean; see `CLAUDE.md`'s build/test section for the exact commands and the deploy caveats around actually restarting the running daemon.
+Every `*_test.go` file (there's one per major subsystem: `serve_test.go`, `stuck_detector_test.go`, `creds_test.go`, `reaper_test.go`, and so on, all in `internal/tn/` alongside the code they test) builds a `Server`/`Client` via `httptest` and the same injected-function seams described above, never a real daemon, tmux session, or vault. `go test -race ./...` is not optional: the project's own history records two real concurrency bugs (a `*Message` JSON-encoded outside its lock while a concurrent inbox poll mutated it, and an unsynchronized slice in a debouncer test) that only `-race` caught, on first use. A change to the daemon isn't done until `gofmt -l .`, `go vet ./...`, `go test ./...`, and `go test -race ./...` are all clean; see `CLAUDE.md`'s build/test section for the exact commands and the deploy caveats around actually restarting the running daemon.
 
 ## Where to change what
 
-- **Adding a CLI command**: `main.go` (usage text + `run()`'s switch + a `cmd*` function), calling into `api.go` or `bridge.go` as appropriate.
-- **Adding a TaskNotes API call**: `api.go`'s `Client` methods.
-- **Changing the task-note body format**: `note_layout.go`; keep it pure (no I/O), and update `SPEC-note-layout.md` and `docs/reference/note-layout.md` alongside it.
-- **Adding a daemon HTTP endpoint**: a handler in `serve.go` plus a route in `newMux`; update `docs/reference/http-api.md`.
-- **Changing the orchestrator spawn/prompt protocol**: `buildOrchestratorPrompt`/`buildLaunchCommand` in `serve.go`, and keep `ORCHESTRATOR.md`, their tests, and `skills/tasknotes/` consistent; see `CLAUDE.md`'s "Conventions & gotchas."
+- **Adding a CLI command**: `internal/tn/main.go` (usage text + `Run()`'s switch + a `cmd*` function), calling into `api.go` or `bridge.go` as appropriate.
+- **Adding a TaskNotes API call**: `internal/tn/api.go`'s `Client` methods.
+- **Changing the task-note body format**: `internal/tn/note_layout.go`; keep it pure (no I/O), and update `docs/design/SPEC-note-layout.md` and `docs/reference/note-layout.md` alongside it.
+- **Adding a daemon HTTP endpoint**: a handler in `internal/tn/handlers.go` (or the relevant topical file) plus a route in `newMux` (`internal/tn/serve.go`); update `docs/reference/http-api.md`.
+- **Changing the orchestrator spawn/prompt protocol**: `buildOrchestratorPrompt`/`buildLaunchCommand` in `internal/tn/spawn.go`, and keep `ORCHESTRATOR.md`, their tests, and `skills/tasknotes/` consistent; see `CLAUDE.md`'s "Conventions & gotchas."
 - **Changing a background loop's behavior**: find it via the region table above; most have a `TN_NO_*` env var to disable them for tests/dev (see `docs/reference/configuration.md`).
 - **Changing the web UI**: `webui/src/`, then `pnpm build` before `go build` picks up the change (see `CLAUDE.md`'s build/test section for the footgun this creates if skipped).
-- **Changing the Obsidian panel**: `obsidian-plugin/`, symlinked into a vault's plugins directory per `SPEC-obsidian-plugin.md`.
+- **Changing the Obsidian panel**: `obsidian-plugin/`, symlinked into a vault's plugins directory per `docs/design/SPEC-obsidian-plugin.md`.
 
 ## Glossary
 
@@ -150,4 +148,4 @@ Every `*_test.go` file (there's one per major subsystem: `serve_test.go`, `stuck
 
 ## Further reading
 
-The `SPEC-*.md` files and `IMPLEMENTATION-PLAN-REMOTE-EXECUTION.md` at the repo root are historical design records, not living documentation: they capture the reasoning behind a change at the time it was made, and the code is the source of truth where they've since drifted. `docs/explanation/design-history.md` indexes all of them with a summary of what each covers. For narrative explanations of how the system behaves today, see `docs/explanation/lifecycle-of-a-task.md`, `docs/explanation/generations-and-drain.md`, and `docs/explanation/security-model.md`.
+The `SPEC-*.md` files and `IMPLEMENTATION-PLAN-REMOTE-EXECUTION.md` in `docs/design/` are historical design records, not living documentation: they capture the reasoning behind a change at the time it was made, and the code is the source of truth where they've since drifted. `docs/explanation/design-history.md` indexes all of them with a summary of what each covers. For narrative explanations of how the system behaves today, see `docs/explanation/lifecycle-of-a-task.md`, `docs/explanation/generations-and-drain.md`, and `docs/explanation/security-model.md`.

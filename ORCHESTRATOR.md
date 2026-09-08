@@ -640,7 +640,7 @@ long-lived session and this contract evolves under you).
   TaskNotes and then spent up to ~40s re-querying for the task before giving up — it
   genuinely doesn't know whether the write landed, and it will NOT guess by retrying
   (an earlier version of this mechanism did guess, and that produced real duplicate
-  tasks during a 2026-08-26 Obsidian outage; see SPEC-serve.md's "Idempotent task
+  tasks during a 2026-08-26 Obsidian outage; see docs/design/SPEC-serve.md's "Idempotent task
   creation" section for the full incident). This fix protects against the DAEMON
   retrying blind — it does nothing to stop YOU from doing the same thing by hand. If
   you see this error: `tn list`/`tn get`/search the board for the title FIRST. If it's

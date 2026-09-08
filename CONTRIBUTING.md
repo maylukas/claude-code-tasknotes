@@ -36,7 +36,7 @@ Requirements:
 Clone the repository and build the binary:
 
 ```bash
-go build -o ~/bin/tn .
+go build -o ~/bin/tn ./cmd/tn
 ```
 
 On macOS, sign the binary after every build so the daemon's Apple Events approval
@@ -103,7 +103,7 @@ Changes under `webui/src` require an extra build step that is easy to forget:
 
 ```bash
 cd webui && pnpm build
-cd .. && go build -o ~/bin/tn .
+cd .. && go build -o ~/bin/tn ./cmd/tn
 ```
 
 `go build` embeds whatever is currently on disk in `webui/dist/`. It has no way to
@@ -115,7 +115,7 @@ changes, or the daemon will silently keep serving the old UI.
 
 If your change alters the daemon's observable behavior (the shape of `/status` or
 `/health`, a new endpoint, or a behavior change a user or the web UI could notice),
-bump the `daemonVersion` constant in `serve.go`. It's surfaced in `/health`, `/status`, and
+bump the `daemonVersion` constant in `internal/tn/serve.go`. It's surfaced in `/health`, `/status`, and
 the web UI footer, and it's the only reliable way to tell whether a running daemon
 actually picked up a given change.
 
