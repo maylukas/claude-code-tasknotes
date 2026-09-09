@@ -30,9 +30,11 @@ package tn
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -62,6 +64,21 @@ const (
 	// orchestrators share one account and hit the limit together, and a
 	// swap that didn't help must not immediately chain into another.
 	credsDefaultMinSwapInterval = 10 * time.Minute
+	// credsDefaultUsagePollInterval/credsMinUsagePollInterval bound the
+	// usage poller's ticker (usage.go's startUsagePoller) — see
+	// resolveServeConfig's clamp.
+	credsDefaultUsagePollInterval = 60 * time.Second
+	credsMinUsagePollInterval     = 30 * time.Second
+	// credsDefaultSwapAtPercent/credsDefaultSwapMarginPercent are the
+	// proactive-swap thresholds (usage.go's maybeProactiveSwap): swap once
+	// the active profile's session window is at or above this percent, but
+	// only to a candidate at least SwapMarginPercent lower — a swap that
+	// barely helps isn't worth disconnecting Remote Control for.
+	credsDefaultSwapAtPercent     = 90.0
+	credsDefaultSwapMarginPercent = 20.0
+	// credsDefaultNudgeDelay is usage.go's credsSwapSettle default —
+	// Claude Code's own ~30s Keychain read cache, plus margin.
+	credsDefaultNudgeDelay = 35 * time.Second
 )
 
 var (
@@ -199,6 +216,24 @@ type credsProfileMeta struct {
 	// Email is best-effort display text captured from ~/.claude.json's
 	// oauthAccount at save time (read-only); empty when unavailable.
 	Email string `json:"email,omitempty"`
+	// Dead/DeadReason/DeadAt mark a profile the usage poller has confirmed
+	// cannot authenticate at all (a 401 on usage fetch that a refresh
+	// couldn't fix, or a refresh itself rejected 400/401) — see usage.go's
+	// pollOneProfile. A dead profile is never returned by Eligible and is
+	// refused by credsUse/handleCredsSwap unless force is passed. Cleared
+	// automatically the moment a usage fetch for it succeeds again
+	// (recordUsageSuccess) — a revoked token can become valid again after a
+	// fresh /login into the same profile followed by `tn creds save`.
+	Dead       bool      `json:"dead,omitempty"`
+	DeadReason string    `json:"deadReason,omitempty"`
+	DeadAt     time.Time `json:"deadAt,omitempty"`
+	// Usage is the last successful usage-poll snapshot for this profile
+	// (nil until the first successful poll). UsageError is the last
+	// transient failure's message, cleared on the next success — kept
+	// separate from Dead, which is reserved for a confirmed
+	// can't-authenticate-at-all state.
+	Usage      *usageSnapshot `json:"usage,omitempty"`
+	UsageError string         `json:"usageError,omitempty"`
 }
 
 type credsMeta struct {
@@ -370,6 +405,13 @@ type credsProfileView struct {
 	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
 	LastLimitedAt *time.Time `json:"lastLimitedAt,omitempty"`
 	LimitedUntil  *time.Time `json:"limitedUntil,omitempty"`
+	// Dead/DeadReason/DeadAt/Usage/UsageError mirror credsProfileMeta's
+	// fields of the same name — see its doc comments.
+	Dead       bool           `json:"dead,omitempty"`
+	DeadReason string         `json:"deadReason,omitempty"`
+	DeadAt     *time.Time     `json:"deadAt,omitempty"`
+	Usage      *usageSnapshot `json:"usage,omitempty"`
+	UsageError string         `json:"usageError,omitempty"`
 }
 
 func credsTimePtr(t time.Time) *time.Time {
@@ -407,6 +449,11 @@ func (c *credsStore) List() (active string, views []credsProfileView, err error)
 			LastUsedAt:    credsTimePtr(p.LastUsedAt),
 			LastLimitedAt: credsTimePtr(p.LastLimitedAt),
 			LimitedUntil:  credsTimePtr(p.LimitedUntil),
+			Dead:          p.Dead,
+			DeadReason:    p.DeadReason,
+			DeadAt:        credsTimePtr(p.DeadAt),
+			Usage:         p.Usage,
+			UsageError:    p.UsageError,
 		})
 	}
 	return active, views, nil
@@ -554,35 +601,42 @@ func (c *credsStore) LastSwap() *credsSwapRecord {
 	return &r
 }
 
-// MarkLimited records that profile label just hit a usage limit whose
-// pane text said it resets at resetRaw; the profile is ineligible for
-// automatic swaps until then (or credsLimitFallbackCooldown when the text
-// can't be parsed). Unknown labels are ignored.
-func (c *credsStore) MarkLimited(label, resetRaw string) (until time.Time, err error) {
+// MarkLimited records that profile label just hit a usage limit that
+// resets at until (from the usage API's Session.ResetsAt — never parsed
+// from pane text, see SPEC-usage-swap.md); the profile is ineligible for
+// automatic swaps until then. A zero or already-past until falls back to
+// credsLimitFallbackCooldown (Claude's session window), for a snapshot
+// that had no resets_at or is stale. Unknown labels are ignored.
+func (c *credsStore) MarkLimited(label string, until time.Time) error {
 	defer c.invalidateCache()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	m, err := c.loadMeta()
 	if err != nil {
-		return time.Time{}, err
+		return err
 	}
 	p := m.Profiles[label]
 	if p == nil {
-		return time.Time{}, nil
+		return nil
 	}
 	now := c.now()
-	until, ok := parseResetTime(resetRaw, now)
-	if !ok {
+	if until.IsZero() || !until.After(now) {
 		until = now.Add(credsLimitFallbackCooldown)
 	}
 	p.LastLimitedAt = now
 	p.LimitedUntil = until
-	return until, c.saveMeta(m)
+	return c.saveMeta(m)
 }
 
-// Eligible lists profiles that could be swapped TO right now: stored,
-// not the active one, not cooling down. Oldest-used first (round-robin).
-func (c *credsStore) Eligible() (active string, eligible []string, err error) {
+// Eligible lists profiles that could be swapped TO right now: stored, not
+// the active one, not dead, not cooling down, and — when a usage snapshot
+// exists for the candidate — under swapAtPercent on its session window and
+// under 100% on its weekly window. Sorted by session percent ascending
+// (lowest usage first), then weekly percent ascending, then LastUsedAt
+// ascending, then label — a candidate with no snapshot yet sorts as 0/0,
+// i.e. before any known-nonzero usage, same as the pre-usage-API
+// oldest-used-first behaviour.
+func (c *credsStore) Eligible(swapAtPercent float64) (active string, eligible []string, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	m, err := c.loadMeta()
@@ -592,12 +646,14 @@ func (c *credsStore) Eligible() (active string, eligible []string, err error) {
 	active = c.resolveActiveLocked(m)
 	now := c.now()
 	type cand struct {
-		label string
-		used  time.Time
+		label      string
+		used       time.Time
+		sessionPct float64
+		weeklyPct  float64
 	}
 	var cs []cand
 	for l, p := range m.Profiles {
-		if l == active {
+		if l == active || p.Dead {
 			continue
 		}
 		if !p.LimitedUntil.IsZero() && p.LimitedUntil.After(now) {
@@ -606,13 +662,27 @@ func (c *credsStore) Eligible() (active string, eligible []string, err error) {
 		if _, err := c.kc.Get(credsProfileService, l); err != nil {
 			continue
 		}
-		cs = append(cs, cand{l, p.LastUsedAt})
+		x := cand{label: l, used: p.LastUsedAt}
+		if p.Usage != nil {
+			if p.Usage.Session.Percent >= swapAtPercent || p.Usage.Weekly.Percent >= 100 {
+				continue
+			}
+			x.sessionPct = p.Usage.Session.Percent
+			x.weeklyPct = p.Usage.Weekly.Percent
+		}
+		cs = append(cs, x)
 	}
 	sort.Slice(cs, func(i, j int) bool {
-		if cs[i].used.Equal(cs[j].used) {
-			return cs[i].label < cs[j].label
+		if cs[i].sessionPct != cs[j].sessionPct {
+			return cs[i].sessionPct < cs[j].sessionPct
 		}
-		return cs[i].used.Before(cs[j].used)
+		if cs[i].weeklyPct != cs[j].weeklyPct {
+			return cs[i].weeklyPct < cs[j].weeklyPct
+		}
+		if !cs[i].used.Equal(cs[j].used) {
+			return cs[i].used.Before(cs[j].used)
+		}
+		return cs[i].label < cs[j].label
 	})
 	for _, x := range cs {
 		eligible = append(eligible, x.label)
@@ -620,39 +690,183 @@ func (c *credsStore) Eligible() (active string, eligible []string, err error) {
 	return active, eligible, nil
 }
 
-// parseResetTime turns the pane's raw reset text ("2:30pm (Europe/Berlin)",
-// "2:30pm", "15:04", "3pm") into the next such wall-clock instant after
-// now. Best effort: ok=false when the text isn't a recognisable clock time.
-func parseResetTime(raw string, now time.Time) (time.Time, bool) {
-	s := strings.TrimSpace(raw)
-	loc := now.Location()
-	if i := strings.Index(s, "("); i >= 0 {
-		if j := strings.Index(s[i:], ")"); j > 0 {
-			if l, err := time.LoadLocation(strings.TrimSpace(s[i+1 : i+j])); err == nil {
-				loc = l
-			}
-		}
-		s = strings.TrimSpace(s[:i])
+// DeadReason reports whether label is currently marked dead, and why (see
+// credsProfileMeta.Dead). Unknown labels report false, "".
+func (c *credsStore) DeadReason(label string) (dead bool, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, err := c.loadMeta()
+	if err != nil {
+		return false, ""
 	}
-	s = strings.ToLower(s)
-	var clock time.Time
-	var parsed bool
-	for _, layout := range []string{"3:04pm", "3pm", "15:04", "15"} {
-		t, err := time.Parse(layout, s)
-		if err == nil {
-			clock, parsed = t, true
-			break
-		}
+	p := m.Profiles[label]
+	if p == nil {
+		return false, ""
 	}
-	if !parsed {
-		return time.Time{}, false
+	return p.Dead, p.DeadReason
+}
+
+// ProfileUsage returns a copy of label's last successful usage snapshot, or
+// nil if the profile is unknown or has never been polled successfully.
+func (c *credsStore) ProfileUsage(label string) *usageSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, err := c.loadMeta()
+	if err != nil {
+		return nil
 	}
-	local := now.In(loc)
-	t := time.Date(local.Year(), local.Month(), local.Day(), clock.Hour(), clock.Minute(), 0, 0, loc)
-	if !t.After(now) {
-		t = t.Add(24 * time.Hour)
+	p := m.Profiles[label]
+	if p == nil || p.Usage == nil {
+		return nil
 	}
-	return t, true
+	u := *p.Usage
+	return &u
+}
+
+// blobFor returns the Keychain blob currently backing label — the live
+// Claude item when active is true, the profile's own item otherwise (see
+// usage.go's ownership rule doc comment).
+func (c *credsStore) blobFor(label string, active bool) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if active {
+		return c.readClaudeBlob()
+	}
+	return c.kc.Get(credsProfileService, label)
+}
+
+// writeProfileBlob overwrites an INACTIVE profile's own Keychain item —
+// used only by the usage poller after refreshing that profile's token
+// (see the ownership rule: tn never writes the active/Claude item except
+// via Swap).
+func (c *credsStore) writeProfileBlob(label string, blob []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.kc.Set(credsProfileService, label, blob)
+}
+
+// recordUsageSuccess stores a fresh snapshot for label and clears any
+// Dead/UsageError state — a usage fetch succeeding is proof the profile
+// can authenticate right now, regardless of what it looked like before.
+func (c *credsStore) recordUsageSuccess(label string, snap *usageSnapshot) error {
+	defer c.invalidateCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, err := c.loadMeta()
+	if err != nil {
+		return err
+	}
+	p := m.Profiles[label]
+	if p == nil {
+		return nil
+	}
+	wasDead := p.Dead
+	p.Dead, p.DeadReason, p.DeadAt = false, "", time.Time{}
+	p.UsageError = ""
+	p.Usage = snap
+	if wasDead {
+		log.Printf("serve: credential profile %q revived (usage fetch succeeded)", label)
+	}
+	return c.saveMeta(m)
+}
+
+// recordUsageError stores a transient failure note for label (a fetch/
+// refresh error that doesn't rise to "confirmed dead" — see markDead),
+// keeping its last good snapshot untouched.
+func (c *credsStore) recordUsageError(label, msg string) error {
+	defer c.invalidateCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, err := c.loadMeta()
+	if err != nil {
+		return err
+	}
+	p := m.Profiles[label]
+	if p == nil {
+		return nil
+	}
+	p.UsageError = msg
+	return c.saveMeta(m)
+}
+
+// markDead marks label as confirmed unable to authenticate (see
+// credsProfileMeta.Dead) — logs only on the alive->dead transition, never
+// on a repeated confirmation.
+func (c *credsStore) markDead(label, reason string, at time.Time) error {
+	defer c.invalidateCache()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, err := c.loadMeta()
+	if err != nil {
+		return err
+	}
+	p := m.Profiles[label]
+	if p == nil {
+		return nil
+	}
+	wasDead := p.Dead
+	p.Dead, p.DeadReason, p.DeadAt = true, reason, at
+	if !wasDead {
+		log.Printf("serve: credential profile %q marked dead: %s", label, reason)
+	}
+	return c.saveMeta(m)
+}
+
+// credsBlobTokens is the identity-bearing fields parseCredsBlobTokens pulls
+// out of a Claude credentials blob, including ExpiresAt (unlike
+// credsTokens, which is deliberately access/refresh only for the
+// resolveActiveLocked matching path).
+type credsBlobTokens struct {
+	Access    string
+	Refresh   string
+	ExpiresAt time.Time // zero when absent/zero in the blob
+}
+
+func parseCredsBlobTokens(blob []byte) credsBlobTokens {
+	var v struct {
+		ClaudeAiOauth struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresAt    int64  `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(blob, &v) != nil {
+		return credsBlobTokens{}
+	}
+	t := credsBlobTokens{Access: v.ClaudeAiOauth.AccessToken, Refresh: v.ClaudeAiOauth.RefreshToken}
+	if v.ClaudeAiOauth.ExpiresAt > 0 {
+		t.ExpiresAt = time.UnixMilli(v.ClaudeAiOauth.ExpiresAt)
+	}
+	return t
+}
+
+// updateCredsBlobTokens returns blob with claudeAiOauth.accessToken/
+// refreshToken/expiresAt updated, preserving every other field in the blob
+// (scopes, subscriptionType, ...) — a raw map round-trip rather than a
+// typed struct, since those other fields are opaque to tn and must survive
+// a refresh untouched. refresh is only overwritten when non-empty (a
+// refresh response's refresh_token is documented nullable — "reuse the
+// existing one" when absent).
+func updateCredsBlobTokens(blob []byte, access, refresh string, expiresAt time.Time) ([]byte, error) {
+	var v map[string]any
+	if err := json.Unmarshal(blob, &v); err != nil {
+		return nil, err
+	}
+	oauth, _ := v["claudeAiOauth"].(map[string]any)
+	if oauth == nil {
+		oauth = map[string]any{}
+	}
+	if access != "" {
+		oauth["accessToken"] = access
+	}
+	if refresh != "" {
+		oauth["refreshToken"] = refresh
+	}
+	if !expiresAt.IsZero() {
+		oauth["expiresAt"] = expiresAt.UnixMilli()
+	}
+	v["claudeAiOauth"] = oauth
+	return json.Marshal(v)
 }
 
 // credsNudgeText is what gets typed into a parked pane after a swap. It
@@ -686,7 +900,7 @@ func nudgeParkedPane(session, toLabel string, sendKeys sendKeysFunc) error {
 
 func cmdCreds(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: tn creds save|list|use|rm [label]")
+		return fmt.Errorf("usage: tn creds save|list|usage|use|rm [label]")
 	}
 	store := newCredsStore(securityCLIKeychain{}, defaultCredsMetaPath())
 	sub, rest := args[0], args[1:]
@@ -704,45 +918,21 @@ func cmdCreds(args []string) error {
 		} else {
 			fmt.Printf("saved profile %q — now the active profile\n", rest[0])
 		}
+		probeSavedProfileUsage(store, rest[0])
+		fmt.Println("note: never /logout to switch accounts — it revokes the token you just saved; /login directly into the other account instead.")
 		return nil
-	case "list":
-		active, views, err := store.List()
-		if err != nil {
+	case "list", "usage":
+		return cmdCredsList(store)
+	case "use":
+		fs := flag.NewFlagSet("tn creds use", flag.ContinueOnError)
+		force := fs.Bool("force", false, "swap even if the target profile is marked dead")
+		if err := fs.Parse(rest); err != nil {
 			return err
 		}
-		if len(views) == 0 {
-			fmt.Println("no credential profiles — run /login in a Claude session, then `tn creds save <label>`")
-			return nil
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: tn creds use [--force] <label>")
 		}
-		now := time.Now()
-		fmt.Printf("%-2s %-16s %-32s %-22s %s\n", "", "LABEL", "EMAIL", "LIMITED UNTIL", "LAST USED")
-		for _, v := range views {
-			mark := " "
-			if v.Active {
-				mark = "*"
-			}
-			limited := ""
-			if v.LimitedUntil != nil && v.LimitedUntil.After(now) {
-				limited = v.LimitedUntil.Local().Format("2006-01-02 15:04")
-			}
-			used := ""
-			if v.LastUsedAt != nil {
-				used = v.LastUsedAt.Local().Format("2006-01-02 15:04")
-			}
-			if !v.Stored {
-				used = "(no Keychain item — re-save)"
-			}
-			fmt.Printf("%-2s %-16s %-32s %-22s %s\n", mark, v.Label, v.Email, limited, used)
-		}
-		if active == "" {
-			fmt.Println("\n(current Keychain credentials match no saved profile — `tn creds save <label>` to capture them)")
-		}
-		return nil
-	case "use":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: tn creds use <label>")
-		}
-		return credsUse(store, rest[0])
+		return credsUse(store, fs.Arg(0), *force)
 	case "rm":
 		if len(rest) != 1 {
 			return fmt.Errorf("usage: tn creds rm <label>")
@@ -753,23 +943,130 @@ func cmdCreds(args []string) error {
 		fmt.Printf("removed profile %q\n", rest[0])
 		return nil
 	default:
-		return fmt.Errorf("tn creds: unknown subcommand %q (save|list|use|rm)", sub)
+		return fmt.Errorf("tn creds: unknown subcommand %q (save|list|usage|use|rm)", sub)
+	}
+}
+
+// probeSavedProfileUsage does one usage Fetch right after a save with the
+// blob that was just written, so a profile that can't actually authenticate
+// (already-revoked refresh token, wrong account) is reported immediately —
+// see SPEC-usage-swap.md's incident write-up — rather than discovered hours
+// later when auto-swap picks it and takes every session down. Best effort:
+// prints the result or the failure, never returns an error (a save that
+// succeeded must not be reported as failed because the network probe
+// afterward had trouble).
+func probeSavedProfileUsage(store *credsStore, label string) {
+	blob, err := store.kc.Get(credsProfileService, label)
+	if err != nil {
+		return
+	}
+	tok := parseCredsBlobTokens(blob)
+	if tok.Access == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	snap, status, err := newHTTPUsageClient().Fetch(ctx, tok.Access)
+	switch {
+	case err != nil:
+		fmt.Printf("usage check failed: %v\n", err)
+	case status == http.StatusOK:
+		fmt.Printf("session %.0f%% · weekly %.0f%%\n", snap.Session.Percent, snap.Weekly.Percent)
+	default:
+		fmt.Printf("usage check failed: HTTP %d (this profile may not be able to authenticate)\n", status)
+	}
+}
+
+// cmdCredsList implements `tn creds list`/`tn creds usage`: prefers the
+// daemon's GET /creds (fresh usage snapshots, kept current by the poller),
+// falling back to reading the store directly (metadata only, no HTTP) when
+// the daemon isn't reachable.
+func cmdCredsList(store *credsStore) error {
+	b := NewBridgeClient(resolveBridgeURL())
+	if body, err := b.request(http.MethodGet, "/creds", nil); err == nil {
+		var resp struct {
+			Active   string             `json:"active"`
+			Profiles []credsProfileView `json:"profiles"`
+		}
+		if json.Unmarshal(body, &resp) == nil {
+			printCredsList(resp.Active, resp.Profiles)
+			return nil
+		}
+	}
+	active, views, err := store.List()
+	if err != nil {
+		return err
+	}
+	printCredsList(active, views)
+	return nil
+}
+
+// printCredsList renders the LABEL EMAIL SESSION WEEKLY RESETS
+// LIMITED-UNTIL LAST-USED STATE table. SESSION/WEEKLY/RESETS are blank
+// when no usage snapshot is available yet (store fallback, or a profile
+// never polled).
+func printCredsList(active string, views []credsProfileView) {
+	if len(views) == 0 {
+		fmt.Println("no credential profiles — run /login in a Claude session, then `tn creds save <label>`")
+		return
+	}
+	now := time.Now()
+	fmt.Printf("%-2s %-16s %-32s %-8s %-8s %-6s %-17s %-17s %s\n",
+		"", "LABEL", "EMAIL", "SESSION", "WEEKLY", "RESETS", "LIMITED-UNTIL", "LAST-USED", "STATE")
+	for _, v := range views {
+		mark := " "
+		if v.Active {
+			mark = "*"
+		}
+		session, weekly, resets := "", "", ""
+		if v.Usage != nil {
+			session = fmt.Sprintf("%.0f%%", v.Usage.Session.Percent)
+			weekly = fmt.Sprintf("%.0f%%", v.Usage.Weekly.Percent)
+			if !v.Usage.Session.ResetsAt.IsZero() {
+				resets = v.Usage.Session.ResetsAt.Local().Format("15:04")
+			}
+		}
+		limited := ""
+		if v.LimitedUntil != nil && v.LimitedUntil.After(now) {
+			limited = v.LimitedUntil.Local().Format("2006-01-02 15:04")
+		}
+		used := ""
+		if v.LastUsedAt != nil {
+			used = v.LastUsedAt.Local().Format("2006-01-02 15:04")
+		}
+		state := ""
+		switch {
+		case v.Active:
+			state = "active"
+		case v.Dead:
+			state = "DEAD: " + v.DeadReason
+		case !v.Stored:
+			state = "stale (no Keychain item)"
+		}
+		fmt.Printf("%-2s %-16s %-32s %-8s %-8s %-6s %-17s %-17s %s\n",
+			mark, v.Label, v.Email, session, weekly, resets, limited, used, state)
+	}
+	if active == "" {
+		fmt.Println("\n(current Keychain credentials match no saved profile — `tn creds save <label>` to capture them)")
 	}
 }
 
 // credsUse prefers the daemon (POST /creds/swap) so parked orchestrator
-// panes get nudged; without a daemon it swaps directly and says so.
-func credsUse(store *credsStore, label string) error {
+// panes get nudged (after the settle delay — see usage.go's
+// credsSwapSettle); without a daemon it swaps directly and says so. A dead
+// target is refused unless force is set.
+func credsUse(store *credsStore, label string, force bool) error {
 	b := NewBridgeClient(resolveBridgeURL())
-	body, err := b.request("POST", "/creds/swap", map[string]any{"label": label})
+	body, err := b.request("POST", "/creds/swap", map[string]any{"label": label, "force": force})
 	if err == nil {
 		var res struct {
-			From   string   `json:"from"`
-			To     string   `json:"to"`
-			Nudged []string `json:"nudged"`
+			From         string   `json:"from"`
+			To           string   `json:"to"`
+			NudgePending []string `json:"nudgePending"`
 		}
 		_ = json.Unmarshal(body, &res)
-		fmt.Printf("swapped credentials %s → %s via daemon; %d parked pane(s) nudged\n", orUnknown(res.From), res.To, len(res.Nudged))
+		fmt.Printf("swapped credentials %s → %s via daemon; %d parked pane(s) will be nudged in ~%s\n",
+			orUnknown(res.From), res.To, len(res.NudgePending), credsSwapSettle)
 		fmt.Println("note: every Claude session on this machine now uses this account (Remote Control sessions disconnect).")
 		return nil
 	}
@@ -780,6 +1077,11 @@ func credsUse(store *credsStore, label string) error {
 			return fmt.Errorf("daemon refused swap: %s", strings.TrimSpace(he.Body))
 		}
 		return err
+	}
+	if !force {
+		if dead, reason := store.DeadReason(label); dead {
+			return fmt.Errorf("profile %q is dead: %s (pass --force to override)", label, reason)
+		}
 	}
 	from, err := store.Swap(label, "manual")
 	if err != nil {
@@ -823,13 +1125,15 @@ func (r *credsAutoSwapResult) dialogText(agentName, resetsAt string) string {
 }
 
 // autoSwapCredentials is the rate-limit episode hook. When enabled it
-// marks the active profile as limited until the pane's reset time, swaps
-// to the oldest-used eligible profile (respecting MinSwapInterval since
-// the last swap), and nudges EVERY currently rate-limited pane — they
-// share the account, so they all parked together and all come back
+// marks the active profile as limited (using its own last-polled usage
+// snapshot's Session.ResetsAt, never pane text — see MarkLimited), swaps
+// to the top eligible profile (respecting MinSwapInterval since the last
+// swap), and schedules a nudge for EVERY currently rate-limited pane —
+// they share the account, so they all parked together and all come back
 // together. Every failure degrades to "no swap + a note in the dialog";
-// nothing here can take the detector down.
-func (s *Server) autoSwapCredentials(agentName, resetRaw string, now time.Time, sendKeys sendKeysFunc) *credsAutoSwapResult {
+// nothing here can take the detector down. capture/sendKeys are threaded
+// through to scheduleNudge (usage.go) so tests never touch tmux/osascript.
+func (s *Server) autoSwapCredentials(agentName, resetRaw string, now time.Time, capture captureFunc, sendKeys sendKeysFunc) *credsAutoSwapResult {
 	if s.creds == nil || !s.config.Credentials.AutoSwap {
 		return nil
 	}
@@ -842,19 +1146,27 @@ func (s *Server) autoSwapCredentials(agentName, resetRaw string, now time.Time, 
 			return res
 		}
 	}
-	active, eligible, err := s.creds.Eligible()
+	swapAt := s.config.Credentials.SwapAtPercent
+	if swapAt <= 0 {
+		swapAt = credsDefaultSwapAtPercent
+	}
+	active, eligible, err := s.creds.Eligible(swapAt)
 	if err != nil {
 		res.note = "could not read credential profiles: " + err.Error()
 		log.Printf("serve: credential auto-swap failed for %s: %v", agentName, err)
 		return res
 	}
 	if active != "" {
-		if _, err := s.creds.MarkLimited(active, resetRaw); err != nil {
+		var until time.Time
+		if u := s.creds.ProfileUsage(active); u != nil {
+			until = u.Session.ResetsAt
+		}
+		if err := s.creds.MarkLimited(active, until); err != nil {
 			log.Printf("serve: credential auto-swap: mark %q limited: %v", active, err)
 		}
 	}
 	if len(eligible) == 0 {
-		res.note = "no eligible credential profile (none saved, or all cooling down)."
+		res.note = "no eligible credential profile (none saved, all cooling down, or all dead)."
 		log.Printf("serve: credential auto-swap skipped for %s: %s", agentName, res.note)
 		return res
 	}
@@ -867,7 +1179,7 @@ func (s *Server) autoSwapCredentials(agentName, resetRaw string, now time.Time, 
 	}
 	res.swapped, res.from, res.to = true, from, target
 	log.Printf("serve: credentials auto-swapped %s → %s (trigger %s, resets %s)", orUnknown(from), target, agentName, resetRaw)
-	res.nudged = s.nudgeRateLimitedPanes(target, sendKeys)
+	res.nudged = s.scheduleNudge(target, capture, sendKeys, s.postSwapNudgeDone)
 	return res
 }
 
@@ -898,22 +1210,6 @@ func (s *Server) rateLimitedSessions() [][2]string {
 	return out
 }
 
-// nudgeRateLimitedPanes resumes every parked pane after a swap; returns
-// the agent names that were nudged successfully.
-func (s *Server) nudgeRateLimitedPanes(toLabel string, sendKeys sendKeysFunc) []string {
-	var nudged []string
-	for _, pair := range s.rateLimitedSessions() {
-		name, session := pair[0], pair[1]
-		if err := nudgeParkedPane(session, toLabel, sendKeys); err != nil {
-			log.Printf("serve: nudge %s (session %s) after credential swap: %v", name, session, err)
-			continue
-		}
-		log.Printf("serve: nudged %s (session %s) to continue on profile %s", name, session, toLabel)
-		nudged = append(nudged, name)
-	}
-	return nudged
-}
-
 // handleCredsList implements GET /creds: profiles and swap state, never
 // secrets. Spectator-safe.
 func (s *Server) handleCredsList(w http.ResponseWriter, r *http.Request) {
@@ -929,18 +1225,25 @@ func (s *Server) handleCredsList(w http.ResponseWriter, r *http.Request) {
 	if views == nil {
 		views = []credsProfileView{}
 	}
+	lastPollAt, lastPollErr := s.usageLastPoll()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"autoSwap":        s.config.Credentials.AutoSwap,
-		"minSwapInterval": s.config.Credentials.MinSwapInterval.String(),
-		"active":          active,
-		"profiles":        views,
-		"lastSwap":        s.creds.LastSwap(),
+		"autoSwap":          s.config.Credentials.AutoSwap,
+		"minSwapInterval":   s.config.Credentials.MinSwapInterval.String(),
+		"usagePollInterval": s.config.Credentials.UsagePollInterval.String(),
+		"swapAtPercent":     s.config.Credentials.SwapAtPercent,
+		"active":            active,
+		"profiles":          views,
+		"lastSwap":          s.creds.LastSwap(),
+		"lastPollAt":        credsTimePtr(lastPollAt),
+		"lastPollError":     lastPollErr,
 	})
 }
 
-// handleCredsSwap implements POST /creds/swap {"label"}: a manual swap,
-// then the same pane nudge auto-swap does. 404 unknown label, 409 already
-// active, 503 no store.
+// handleCredsSwap implements POST /creds/swap {"label","force"}: a manual
+// swap, then the same settle-then-nudge every automatic swap does (see
+// usage.go's scheduleNudge — the response reports which panes are PENDING
+// a nudge, not which have already received one). 404 unknown label, 409
+// already active or (without force) a dead target, 503 no store.
 func (s *Server) handleCredsSwap(w http.ResponseWriter, r *http.Request) {
 	if s.creds == nil {
 		http.Error(w, errCredsStoreUnavailable.Error(), http.StatusServiceUnavailable)
@@ -948,6 +1251,7 @@ func (s *Server) handleCredsSwap(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Label string `json:"label"`
+		Force bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
@@ -956,6 +1260,12 @@ func (s *Server) handleCredsSwap(w http.ResponseWriter, r *http.Request) {
 	if req.Label == "" {
 		http.Error(w, "label is required", http.StatusBadRequest)
 		return
+	}
+	if !req.Force {
+		if dead, reason := s.creds.DeadReason(req.Label); dead {
+			http.Error(w, fmt.Sprintf("profile %q is dead: %s (pass force to override)", req.Label, reason), http.StatusConflict)
+			return
+		}
 	}
 	from, err := s.creds.Swap(req.Label, "manual")
 	switch {
@@ -970,15 +1280,19 @@ func (s *Server) handleCredsSwap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("serve: credentials swapped %s → %s (manual)", orUnknown(from), req.Label)
+	capture := s.stuckCapture
+	if capture == nil {
+		capture = capturePaneReal
+	}
 	sendKeys := s.stuckSendKeys
 	if sendKeys == nil {
 		sendKeys = sendKeysReal
 	}
-	nudged := s.nudgeRateLimitedPanes(req.Label, sendKeys)
-	if nudged == nil {
-		nudged = []string{}
+	pending := s.scheduleNudge(req.Label, capture, sendKeys, s.postSwapNudgeDone)
+	if pending == nil {
+		pending = []string{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"from": from, "to": req.Label, "nudged": nudged})
+	writeJSON(w, http.StatusOK, map[string]any{"from": from, "to": req.Label, "nudgePending": pending})
 }
 
 // credsStatusCacheTTL bounds how often /status re-reads the Keychain:
@@ -992,11 +1306,16 @@ func (s *Server) credentialsStatus() *statusCredentials {
 	if s.creds == nil {
 		return nil
 	}
+	lastPollAt, lastPollErr := s.usageLastPoll()
 	out := &statusCredentials{
-		AutoSwap:        s.config.Credentials.AutoSwap,
-		MinSwapInterval: s.config.Credentials.MinSwapInterval.String(),
-		Profiles:        []credsProfileView{},
-		LastSwap:        s.creds.LastSwap(),
+		AutoSwap:          s.config.Credentials.AutoSwap,
+		MinSwapInterval:   s.config.Credentials.MinSwapInterval.String(),
+		UsagePollInterval: s.config.Credentials.UsagePollInterval.String(),
+		SwapAtPercent:     s.config.Credentials.SwapAtPercent,
+		LastPollAt:        credsTimePtr(lastPollAt),
+		LastPollError:     lastPollErr,
+		Profiles:          []credsProfileView{},
+		LastSwap:          s.creds.LastSwap(),
 	}
 	active, views, err := s.creds.ListCached(credsStatusCacheTTL)
 	if err != nil {

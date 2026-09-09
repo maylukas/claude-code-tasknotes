@@ -151,12 +151,26 @@ type ServeConfig struct {
 	OrchestratorDoc string `json:"orchestratorDoc,omitempty"`
 }
 
-// CredentialsConfig controls automatic credential-profile swapping when
-// an orchestrator pane parks on a claude.ai usage limit (see creds.go).
-// Off by default: a swap switches EVERY Claude session on the machine.
+// CredentialsConfig controls automatic credential-profile swapping when a
+// profile approaches or hits a claude.ai usage limit (see creds.go and
+// usage.go). Off by default: a swap switches EVERY Claude session on the
+// machine.
 type CredentialsConfig struct {
 	AutoSwap        bool          `json:"autoSwap"`
 	MinSwapInterval time.Duration `json:"minSwapInterval"`
+	// UsagePollInterval is how often usage.go's poller checks every saved
+	// profile's usage via the claude.ai API (min credsMinUsagePollInterval).
+	UsagePollInterval time.Duration `json:"usagePollInterval"`
+	// SwapAtPercent/SwapMarginPercent gate usage.go's maybeProactiveSwap:
+	// swap once the active profile's session window is at or above
+	// SwapAtPercent, but only to a candidate at least SwapMarginPercent
+	// lower.
+	SwapAtPercent     float64 `json:"swapAtPercent"`
+	SwapMarginPercent float64 `json:"swapMarginPercent"`
+	// NudgeDelay is how long to wait after a swap's Keychain write before
+	// nudging a parked pane (usage.go's credsSwapSettle) — Claude Code's
+	// own ~30s Keychain read cache, plus margin.
+	NudgeDelay time.Duration `json:"nudgeDelay"`
 }
 
 // Server is the daemon's HTTP handler plus its state and dependencies.
@@ -322,6 +336,39 @@ type Server struct {
 	// Keychain-backed store, so no test can ever reach /usr/bin/security
 	// by accident. Endpoints answer 503 while nil; auto-swap is skipped.
 	creds *credsStore
+
+	// usageClient is the claude.ai usage-API client (usage.go). nil unless
+	// cmdServe wires a real httpUsageClient or a test wires a fake — POST
+	// /creds/poll answers 503 while nil. The periodic poller
+	// (startUsagePoller) takes its client as a parameter rather than
+	// reading this field, so tests that only want ONE synchronous poll
+	// pass (pollUsageOnce) never need to start the background goroutine at
+	// all; this field exists purely for handleCredsPoll's synchronous path.
+	usageClient usageClient
+	// usagePollMu serializes pollUsageOnce end to end — it's reachable
+	// both from the ticker (startUsagePoller) and synchronously from POST
+	// /creds/poll, and a concurrent pair of passes racing on the SAME
+	// inactive profile's token refresh can leave it dead (see
+	// pollUsageOnce's own doc comment for the full incident this
+	// prevents).
+	usagePollMu sync.Mutex
+	// usageLastPollAt/usageLastPollErr record the most recent usage-poll
+	// pass's outcome (usage.go's pollUsageOnce), for /creds and
+	// /status.credentials. Guarded by mu, same as the other simple fields.
+	usageLastPollAt  time.Time
+	usageLastPollErr string
+	// usageStrikesMu/usageStrikes count consecutive 401s on the ACTIVE
+	// profile's usage fetch (see usageDeadStrikeThreshold) — its own mutex,
+	// separate from mu, since it's touched only from the poller's
+	// goroutine and never needs to be consistent with the rest of Server's
+	// state.
+	usageStrikesMu sync.Mutex
+	usageStrikes   map[string]int
+	// postSwapNudgeDone is a test-only completion hook (nil in production)
+	// called after scheduleNudge's goroutine finishes, so tests can
+	// synchronize on an async post-swap nudge without a race — see
+	// usage.go's scheduleNudge.
+	postSwapNudgeDone func()
 
 	// reaper is the worktree reaper (reaper.go). nil in tests that don't
 	// set it; cmdServe always wires one (the periodic sweep itself only

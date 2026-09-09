@@ -1757,6 +1757,67 @@ func TestCheckStuckSessionsOnce_RateLimitClearsWhenMarkersVanish(t *testing.T) {
 	}
 }
 
+// TestCheckStuckSessionsOnce_RewrappedResetTextIsOneEpisode verifies
+// normalizeResetText's episode-identity fix: Claude re-wrapping the SAME
+// reset time later in an episode (appending a timezone parenthetical,
+// "8:10pm" -> "8:10pm (Europe/Paris)") must not read as a new episode —
+// live incident: this fired a phantom second dialog and a second auto-swap
+// for a limit that never actually changed (see SPEC-usage-swap.md).
+func TestCheckStuckSessionsOnce_RewrappedResetTextIsOneEpisode(t *testing.T) {
+	srv := newRateLimitTestServer(t, "orchestrator-myapp")
+	var titles []string
+	dialog := func(title, text string, buttons []string) (string, error) {
+		titles = append(titles, title)
+		return "OK", nil
+	}
+	sendKeys := func(session, keys string) error { return nil }
+
+	capture := func(session string) (string, error) {
+		return "You've hit your session limit · resets 8:10pm", nil
+	}
+	srv.checkStuckSessionsOnce(capture, dialog, sendKeys)
+	if len(titles) != 1 {
+		t.Fatalf("expected one dialog after the first tick, got %v", titles)
+	}
+
+	capture = func(session string) (string, error) {
+		return "You've hit your session limit · resets 8:10pm (Europe/Paris)", nil
+	}
+	srv.checkStuckSessionsOnce(capture, dialog, sendKeys)
+	if len(titles) != 1 {
+		t.Errorf("re-wrapped reset text must stay the SAME episode (no second dialog), got %v", titles)
+	}
+	info := srv.stuck.snapshot()["orchestrator-myapp"]
+	if !info.RateLimited || info.RateLimitResetsAt != "8:10pm (Europe/Paris)" {
+		t.Errorf("expected still rate-limited with the latest raw text for display, got %+v", info)
+	}
+}
+
+// TestCheckStuckSessionsOnce_LoginExpiredClearsRateLimitEpisode verifies an
+// auth failure (which Claude never announces with "usage limit has reset")
+// still ends a usage-limit episode — live incident: without this an
+// episode that transitioned into "Login expired · Please run /login"
+// stayed open for 13+ hours (see SPEC-usage-swap.md).
+func TestCheckStuckSessionsOnce_LoginExpiredClearsRateLimitEpisode(t *testing.T) {
+	srv := newRateLimitTestServer(t, "orchestrator-myapp")
+	dialog := func(title, text string, buttons []string) (string, error) { return "OK", nil }
+	sendKeys := func(session, keys string) error { return nil }
+
+	capture := func(session string) (string, error) { return rateLimitPaneContinuing, nil }
+	srv.checkStuckSessionsOnce(capture, dialog, sendKeys)
+	if !srv.stuck.snapshot()["orchestrator-myapp"].RateLimited {
+		t.Fatal("expected rate-limited after the first tick")
+	}
+
+	capture = func(session string) (string, error) {
+		return "Login expired · Please run /login to continue.", nil
+	}
+	srv.checkStuckSessionsOnce(capture, dialog, sendKeys)
+	if info := srv.stuck.snapshot()["orchestrator-myapp"]; info.RateLimited {
+		t.Errorf("expected the episode cleared by an auth failure, got %+v", info)
+	}
+}
+
 // TestCheckStuckSessionsOnce_RateLimitDialogOncePerEpisode verifies the
 // notification fires exactly once for an episode no matter how many ticks
 // it spans (there is nothing to approve, so re-showing it would be pure

@@ -115,13 +115,25 @@ var rateLimitMarkers = []string{
 	"continuing automatically at",
 }
 
-// rateLimitClearedMarker is the line Claude prints when the limit lifts
-// ("Your claude.ai usage limit has reset. Continue the task you were
-// working on..."), after which the session resumes on its own. Checked
-// BEFORE rateLimitMarkers: the banner that announced the limit is still
-// sitting in the same window at that moment, so marker-presence alone
-// would keep the episode open for as long as it took to scroll away.
-const rateLimitClearedMarker = "usage limit has reset"
+// rateLimitClearedMarkers are the lines that end a usage-limit episode.
+// Checked BEFORE rateLimitMarkers: the banner that announced the limit is
+// still sitting in the same window at that moment, so marker-presence
+// alone would keep the episode open for as long as it took to scroll away.
+//
+//   - "usage limit has reset": Claude's own "Your claude.ai usage limit has
+//     reset. Continue the task you were working on..." banner, after which
+//     the session resumes on its own.
+//   - "login expired" / "please run /login": an AUTH failure, not a
+//     resolved usage limit — but it still ends the episode. Claude never
+//     prints "usage limit has reset" on this path (a bad/revoked token
+//     doesn't reset, it just keeps failing), so without this an episode
+//     that transitioned into an auth failure stuck open for 13+ hours in
+//     the live incident this fixes (see SPEC-usage-swap.md).
+var rateLimitClearedMarkers = []string{
+	"usage limit has reset",
+	"login expired",
+	"please run /login",
+}
 
 // detectRateLimitWait reports whether the pane shows a live usage-limit
 // wait, plus the RAW reset-time text as printed (e.g. "2:30pm
@@ -134,8 +146,10 @@ const rateLimitClearedMarker = "usage limit has reset"
 func detectRateLimitWait(pane string) (resetsAt string, limited bool) {
 	recent := lastNLines(pane, rateLimitScanLines)
 	lower := strings.ToLower(recent)
-	if strings.Contains(lower, rateLimitClearedMarker) {
-		return "", false
+	for _, m := range rateLimitClearedMarkers {
+		if strings.Contains(lower, m) {
+			return "", false
+		}
 	}
 	found := false
 	for _, m := range rateLimitMarkers {
@@ -600,6 +614,27 @@ func buildRateLimitDialogText(resetsAt string) string {
 		"the new credentials), or /usage-credits in the pane.", resets)
 }
 
+// normalizeResetText makes a pane's reset-time text comparable across
+// re-wraps and other cosmetic changes within the SAME usage-limit episode
+// — e.g. Claude appending a timezone parenthetical later in the episode:
+// "8:10pm" -> "8:10pm (Europe/Paris)". Without this, stuck.go's episode
+// identity (keyed on the raw string) treated that as a second, phantom
+// episode — firing a second dialog and a second auto-swap for a limit that
+// never actually changed (live incident, see SPEC-usage-swap.md).
+// Lowercases, strips a trailing parenthesised zone, and collapses
+// whitespace; used ONLY for comparison, never for display (display keeps
+// the raw text).
+func normalizeResetText(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, ")") {
+		if i := strings.LastIndex(s, "("); i >= 0 {
+			s = strings.TrimSpace(s[:i])
+		}
+	}
+	s = strings.ToLower(s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // lastNLines returns the last n lines of text (fewer if text is shorter).
 func lastNLines(text string, n int) string {
 	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
@@ -890,8 +925,10 @@ func (s *Server) updateStuckState(agentName, session string, stuck, unackedBackl
 		st.RateLimitResetsAt = rateResets
 		// One dialog per episode; a changed reset string IS a new
 		// episode (the limit moved, so the previous notification's
-		// headline fact is now wrong).
-		if !st.RateLimitDialogShown || st.RateLimitDialogResets != rateResets {
+		// headline fact is now wrong) — compared on the NORMALIZED form
+		// (see normalizeResetText) so a re-wrap mid-episode isn't mistaken
+		// for a new one.
+		if !st.RateLimitDialogShown || normalizeResetText(st.RateLimitDialogResets) != normalizeResetText(rateResets) {
 			showRateLimitDialog = true
 			st.RateLimitDialogShown = true
 			st.RateLimitDialogResets = rateResets
@@ -1039,7 +1076,7 @@ func (s *Server) updateStuckState(agentName, session string, stuck, unackedBackl
 	// feed): an episode is self-resolving and typically minutes long, so
 	// it belongs in the daemon log next to the stuck transitions, not as
 	// two entries in the user's feed every time a limit is hit.
-	if rateLimited && (!wasRateLimited || prevRateResets != rateResets) {
+	if rateLimited && (!wasRateLimited || normalizeResetText(prevRateResets) != normalizeResetText(rateResets)) {
 		log.Printf("serve: %s usage-limit wait detected (resets %s)", agentName, rateResets)
 	}
 	if !rateLimited && wasRateLimited {
@@ -1051,7 +1088,7 @@ func (s *Server) updateStuckState(agentName, session string, stuck, unackedBackl
 		// again by then, not waiting on a click.
 		title := fmt.Sprintf("Usage limit — %s", agentName)
 		text := buildRateLimitDialogText(rateResets)
-		if res := s.autoSwapCredentials(agentName, rateResets, now, sendKeys); res != nil {
+		if res := s.autoSwapCredentials(agentName, rateResets, now, capture, sendKeys); res != nil {
 			if res.swapped {
 				title = "Usage limit — credentials swapped"
 			}

@@ -464,6 +464,8 @@ Lists credential profiles and the daemon's credential-swap configuration. Specta
 {
   "autoSwap": true,
   "minSwapInterval": "10m0s",
+  "usagePollInterval": "1m0s",
+  "swapAtPercent": 90,
   "active": "work",
   "profiles": [
     {
@@ -474,13 +476,21 @@ Lists credential profiles and the daemon's credential-swap configuration. Specta
       "savedAt": "2026-08-01T09:00:00Z",
       "lastUsedAt": "2026-09-02T10:00:00Z",
       "lastLimitedAt": null,
-      "limitedUntil": null
+      "limitedUntil": null,
+      "dead": false,
+      "usage": {
+        "session": {"percent": 12, "resetsAt": "2026-09-09T11:39:59Z"},
+        "weekly": {"percent": 3, "resetsAt": "2026-09-11T03:59:59Z"},
+        "fetchedAt": "2026-09-09T10:40:03Z"
+      }
     }
   ],
-  "lastSwap": {"from": "personal", "to": "work", "trigger": "manual", "at": "2026-09-02T10:00:00Z"}
+  "lastSwap": {"from": "personal", "to": "work", "trigger": "manual", "at": "2026-09-02T10:00:00Z"},
+  "lastPollAt": "2026-09-09T10:40:03Z",
+  "lastPollError": ""
 }
 ```
-`stored: false` means a profile has metadata but its Keychain item is missing (an orphaned record). `active` is resolved live by matching the live Keychain credential blob against each stored profile, not just a recorded label. `lastSwap` is `null` if no swap has happened yet during this daemon process's lifetime (in-memory only, not persisted). Never includes secret values.
+`stored: false` means a profile has metadata but its Keychain item is missing (an orphaned record). `active` is resolved live by matching the live Keychain credential blob against each stored profile, not just a recorded label. `lastSwap` is `null` if no swap has happened yet during this daemon process's lifetime (in-memory only, not persisted). `usage` is the profile's last-polled claude.ai usage snapshot (`usage.go`'s background poller, every `usagePollInterval`) — omitted until the first successful poll. A profile the poller has confirmed can't authenticate carries `dead: true`, `deadReason`, `deadAt`; `usageError` carries the last transient (non-dead) fetch/refresh failure, if any. `lastPollAt`/`lastPollError` describe the most recent poll pass as a whole. Never includes secret values.
 
 **Status codes:** `200` normal · `503` plain text `"credential store unavailable"` if no credential store is wired for this daemon instance · `500` if reading the credential metadata fails.
 
@@ -488,9 +498,9 @@ Lists credential profiles and the daemon's credential-swap configuration. Specta
 
 Swaps the active claude.ai credentials, the daemon-side half of `tn creds use`.
 
-**Request:** `{"label": "..."}`: required.
+**Request:** `{"label": "...", "force": false}`: `label` required; `force` (default `false`) bypasses the dead-profile refusal below.
 
-**Response:** `200`: `{"from": "personal", "to": "work", "nudged": ["orchestrator-myapp-g3"]}`. `nudged` lists agent names whose parked, rate-limited tmux panes were resumed after the swap; always an array.
+**Response:** `200`: `{"from": "personal", "to": "work", "nudgePending": ["orchestrator-myapp-g3"]}`. `nudgePending` lists agent names whose parked, rate-limited tmux panes WILL be nudged — the nudge itself happens after `credentials.nudgeDelay` (default 35s) in the background, not before this response is sent; always an array.
 
 **Status codes:**
 | Code | Condition |
@@ -498,11 +508,21 @@ Swaps the active claude.ai credentials, the daemon-side half of `tn creds use`.
 | `503` | No credential store wired. |
 | `400` | Invalid JSON or empty `label`. |
 | `404` | Target label unknown, including a profile whose metadata exists but whose Keychain item is missing. |
-| `409` | Target label is already the active profile. |
+| `409` | Target label is already the active profile, or (without `force: true`) the usage poller has marked it dead. |
 | `500` | Any other failure (Keychain read/write, account lookup, metadata save). |
 | `200` | Swapped. |
 
 **Notes:** Because Claude Code stores its OAuth blob in one Keychain item shared by every session on the machine, a swap affects *every* running Claude Code session at once, not just one. Before overwriting the live item, the daemon writes the live blob back into the *previously* active profile first: this captures any token rotation Claude Code did since the last swap, so swapping back later doesn't land on a dead token.
+
+### `POST /creds/poll`
+
+Runs one usage-poll pass synchronously (real HTTP calls to claude.ai) and returns the same body as `GET /creds` — for forcing fresh numbers (e.g. right after a `/login` + `tn creds save`) without waiting out `usagePollInterval`.
+
+**Request:** none.
+
+**Response:** same shape as `GET /creds`.
+
+**Status codes:** `503` if no credential store or no usage client is wired · `200` otherwise.
 
 ---
 

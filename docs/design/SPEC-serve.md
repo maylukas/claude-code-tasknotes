@@ -499,6 +499,37 @@ Endpoints: `GET /creds` → `{autoSwap, minSwapInterval, active, profiles:[{labe
 
 Caveats, stated once here and in the README: a swap switches EVERY Claude session on the machine including interactive ones and disconnects Remote Control; the `security add-generic-password -w <secret>` argument is briefly visible in `ps` (Claude Code writes the item the same way; there is no stdin form); and rotating accounts to get past usage limits may conflict with Anthropic's usage policy — the feature is opt-in for that reason.
 
+**Superseded (daemon 0.10.0) — see `docs/design/SPEC-usage-swap.md`.** The
+pane-text-derived cooldown described above (`parseResetTime`,
+`MarkLimited(label, resetRaw string)`) is GONE: a live incident
+(2026-09-08/09 — an unprobed dead profile taking down every session, a
+phantom rate-limit episode from an un-normalized reset string, a nudge
+racing Claude's own Keychain read cache) showed pane text can't be trusted
+to answer "can this profile authenticate" or "when does this reset."
+`usage.go` now polls claude.ai's own `GET /api/oauth/usage` for every saved
+profile (active included) every `credentials.usagePollInterval` (default
+60s), refreshing an INACTIVE profile's token itself when near expiry (the
+ACTIVE profile's refresh stays Claude Code's alone — tn only ever reads
+it), and marks a profile `dead` on a confirmed can't-authenticate outcome
+(inactive: 401 + refresh rejected; active: 3 consecutive 401s, since Claude
+Code may be mid-refresh). `Eligible` now excludes dead profiles and sorts
+by last-polled session-usage percent instead of purely oldest-used, and a
+new `maybeProactiveSwap` can swap BEFORE any pane ever parks on a hard
+limit (`credentials.swapAtPercent`/`swapMarginPercent`, both configurable).
+The reactive (pane-triggered) path in `stuck.go` still exists as a
+fallback, but `MarkLimited` now always takes a `time.Time` sourced from the
+usage snapshot, never parsed pane text. Post-swap nudging waits
+`credentials.nudgeDelay` (default 35s, matching Claude Code's own ~30s
+Keychain read cache) before typing into a parked pane, and skips a pane
+whose text shows an auth failure rather than a usage-limit park. New
+endpoints: `POST /creds/poll` (one synchronous poll pass); `POST
+/creds/swap` gained `force` (bypass a dead-target refusal) and its
+response field is now `nudgePending` (pending, not already-sent — the
+nudge happens after the settle delay). `tn creds list`/`tn creds usage`
+show live session/weekly percentages when the daemon is reachable; `tn
+creds save` probes the just-saved profile immediately so a dead token is
+caught at save time, not hours later.
+
 ## Worktree reaper (2026-09-03, daemon 0.6.1)
 
 Every `isolation:"worktree"` worker gets `<cwd>/.claude/worktrees/agent-<id>`; the harness removes it only when UNCHANGED at exit, and every real worker commits, so nothing is ever removed (census 2026-09-03, myapp: 103 agent worktrees — 7 locked, 28 dirty, 28 with unpushed commits, 8 merged, 11 already-deleted directories). ORCHESTRATOR.md's "tear down on task done" is not happening either. `reaper.go` is the daemon-side answer.

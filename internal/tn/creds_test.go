@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -202,32 +203,36 @@ func TestCreds_SwapWritesBackRotatedTokenBeforeOverwriting(t *testing.T) {
 	}
 }
 
-func TestParseResetTime(t *testing.T) {
-	berlin, _ := time.LoadLocation("Europe/Berlin")
-	now := time.Date(2026, 9, 2, 13, 0, 0, 0, berlin) // 13:00 Berlin
-	cases := []struct {
-		raw  string
-		want time.Time
-		ok   bool
-	}{
-		{"2:30pm (Europe/Berlin)", time.Date(2026, 9, 2, 14, 30, 0, 0, berlin), true},
-		{"2:30pm", time.Date(2026, 9, 2, 14, 30, 0, 0, berlin), true},
-		{"15:04", time.Date(2026, 9, 2, 15, 4, 0, 0, berlin), true},
-		{"3pm", time.Date(2026, 9, 2, 15, 0, 0, 0, berlin), true},
-		// Already passed today → tomorrow.
-		{"11:00am (Europe/Berlin)", time.Date(2026, 9, 3, 11, 0, 0, 0, berlin), true},
-		{"", time.Time{}, false},
-		{"soon", time.Time{}, false},
+// TestCreds_SwapReReadsLiveBlobMutatedBetweenEligibleAndSwap covers the
+// spec's "re-reads the live item again immediately before overwriting"
+// requirement: a caller (the poller/reactive path) calls Eligible() to
+// decide a target, then the live Keychain item changes (Claude's own
+// mid-turn refresh) before Swap() actually runs — the outgoing profile
+// must end up holding the blob that was live AT SWAP TIME, not whatever
+// was live when Eligible() was consulted.
+func TestCreds_SwapReReadsLiveBlobMutatedBetweenEligibleAndSwap(t *testing.T) {
+	c, kc := newTestCredsStore(t)
+	kc.items[kcKey(claudeCredsService, testKeychainUser)] = credsBlob("accA", "refA")
+	if _, err := c.Save("a"); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		got, ok := parseResetTime(tc.raw, now)
-		if ok != tc.ok {
-			t.Errorf("%q: ok = %v, want %v", tc.raw, ok, tc.ok)
-			continue
-		}
-		if ok && !got.Equal(tc.want) {
-			t.Errorf("%q: got %v, want %v", tc.raw, got, tc.want)
-		}
+	kc.items[kcKey(claudeCredsService, testKeychainUser)] = credsBlob("accB", "refB")
+	if _, err := c.Save("b"); err != nil {
+		t.Fatal(err)
+	}
+	// b is active. A caller consults Eligible() to pick a's the swap target...
+	if _, eligible, err := c.Eligible(credsDefaultSwapAtPercent); err != nil || len(eligible) != 1 || eligible[0] != "a" {
+		t.Fatalf("Eligible() = %v, %v", eligible, err)
+	}
+	// ...then, before Swap() runs, Claude rotates b's live tokens.
+	rotated := credsBlob("accB-rotated", "refB-rotated")
+	kc.items[kcKey(claudeCredsService, testKeychainUser)] = rotated
+
+	if _, err := c.Swap("a", "manual"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := kc.Get(credsProfileService, "b"); !bytes.Equal(got, rotated) {
+		t.Error("outgoing profile b must hold the blob live AT SWAP TIME, not at Eligible() time")
 	}
 }
 
@@ -251,7 +256,7 @@ func TestCreds_MarkLimitedAndEligibleOrdering(t *testing.T) {
 		}
 	}
 	c.now = func() time.Time { return base.Add(10 * time.Minute) }
-	active, eligible, err := c.Eligible()
+	active, eligible, err := c.Eligible(credsDefaultSwapAtPercent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,31 +268,37 @@ func TestCreds_MarkLimitedAndEligibleOrdering(t *testing.T) {
 	}
 
 	// b hits a limit that resets in an hour: ineligible until then.
-	until, err := c.MarkLimited("b", "14:30")
-	if err != nil {
+	until := c.now().Add(time.Hour)
+	if err := c.MarkLimited("b", until); err != nil {
 		t.Fatal(err)
 	}
-	if !until.After(c.now()) {
-		t.Errorf("limitedUntil %v should be in the future", until)
-	}
-	if _, eligible, _ = c.Eligible(); strings.Join(eligible, ",") != "a" {
+	if _, eligible, _ = c.Eligible(credsDefaultSwapAtPercent); strings.Join(eligible, ",") != "a" {
 		t.Errorf("eligible while b cools down = %v, want [a]", eligible)
 	}
-	// Unparseable reset text → 5h fallback.
-	until, _ = c.MarkLimited("a", "later")
-	if want := c.now().Add(credsLimitFallbackCooldown); !until.Equal(want) {
-		t.Errorf("fallback cooldown = %v, want %v", until, want)
+	// Zero (no resets_at from the API) → 5h fallback.
+	if err := c.MarkLimited("a", time.Time{}); err != nil {
+		t.Fatal(err)
 	}
-	if _, eligible, _ = c.Eligible(); len(eligible) != 0 {
+	_, viewsA, _ := c.List()
+	var gotUntil time.Time
+	for _, v := range viewsA {
+		if v.Label == "a" && v.LimitedUntil != nil {
+			gotUntil = *v.LimitedUntil
+		}
+	}
+	if want := c.now().Add(credsLimitFallbackCooldown); !gotUntil.Equal(want) {
+		t.Errorf("fallback cooldown = %v, want %v", gotUntil, want)
+	}
+	if _, eligible, _ = c.Eligible(credsDefaultSwapAtPercent); len(eligible) != 0 {
 		t.Errorf("expected nothing eligible, got %v", eligible)
 	}
 	// Cooldown expires.
 	c.now = func() time.Time { return base.Add(6 * time.Hour) }
-	if _, eligible, _ = c.Eligible(); strings.Join(eligible, ",") != "b,a" {
+	if _, eligible, _ = c.Eligible(credsDefaultSwapAtPercent); strings.Join(eligible, ",") != "b,a" {
 		t.Errorf("after cooldown eligible = %v", eligible)
 	}
 	// Unknown label: ignored, no error.
-	if _, err := c.MarkLimited("ghost", "3pm"); err != nil {
+	if err := c.MarkLimited("ghost", c.now().Add(time.Hour)); err != nil {
 		t.Errorf("unknown label should be ignored, got %v", err)
 	}
 }
@@ -303,9 +314,28 @@ func (k *keyLog) send(session, keys string) error {
 	return nil
 }
 
+// waitForNudge wraps a call expected to trigger exactly one scheduleNudge
+// goroutine (a swap that actually happened), blocking until that
+// goroutine's done hook fires — the async settle-then-nudge design (see
+// usage.go's scheduleNudge) means fn's own return no longer guarantees the
+// nudge has been sent. Never wrap a call that might NOT swap (the hook
+// would then never fire and the test would time out).
+func waitForNudge(t *testing.T, srv *Server, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	srv.postSwapNudgeDone = func() { close(done) }
+	fn()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for post-swap nudge to complete")
+	}
+}
+
 func newAutoSwapTestServer(t *testing.T, autoSwap bool, agents ...string) (*Server, *credsStore, *fakeKeychain) {
 	t.Helper()
 	credsNudgeDelay = 0
+	credsSwapSettle = 0
 	srv := newRateLimitTestServer(t, agents[0])
 	for _, a := range agents[1:] {
 		srv.mu.Lock()
@@ -366,7 +396,7 @@ func TestAutoSwap_SwapsNudgesAllParkedPanesAndRespectsMinInterval(t *testing.T) 
 	}
 	kl := &keyLog{}
 
-	srv.checkStuckSessionsOnce(capture, dialog, kl.send)
+	waitForNudge(t, srv, func() { srv.checkStuckSessionsOnce(capture, dialog, kl.send) })
 
 	if got, _ := kc.Get(claudeCredsService, testKeychainUser); !bytes.Equal(got, credsBlob("accB", "refB")) {
 		t.Fatal("Claude item should now hold profile b")
@@ -418,7 +448,7 @@ func TestAutoSwap_SwapsNudgesAllParkedPanesAndRespectsMinInterval(t *testing.T) 
 	// A later episode after the interval, with everything cooling down
 	// except nothing → "no eligible" note, no swap, no keys.
 	c.lastSwap.At = time.Now().Add(-time.Hour)
-	if _, err := c.MarkLimited("a", "later"); err != nil {
+	if err := c.MarkLimited("a", time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	kl.keys = nil
@@ -510,17 +540,19 @@ func TestCredsEndpoints(t *testing.T) {
 	if rec := post(`{}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("missing label = %d", rec.Code)
 	}
-	rec = post(`{"label":"b"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("swap = %d: %s", rec.Code, rec.Body)
-	}
 	var res struct {
-		From   string   `json:"from"`
-		To     string   `json:"to"`
-		Nudged []string `json:"nudged"`
+		From         string   `json:"from"`
+		To           string   `json:"to"`
+		NudgePending []string `json:"nudgePending"`
 	}
-	_ = json.Unmarshal(rec.Body.Bytes(), &res)
-	if res.From != "a" || res.To != "b" || strings.Join(res.Nudged, ",") != "orchestrator-myapp" {
+	waitForNudge(t, srv, func() {
+		rec = post(`{"label":"b"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("swap = %d: %s", rec.Code, rec.Body)
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &res)
+	})
+	if res.From != "a" || res.To != "b" || strings.Join(res.NudgePending, ",") != "orchestrator-myapp" {
 		t.Errorf("swap response = %+v", res)
 	}
 	if got, _ := kc.Get(claudeCredsService, testKeychainUser); !bytes.Equal(got, credsBlob("accB", "refB")) {
@@ -545,12 +577,76 @@ func TestCredsEndpoints(t *testing.T) {
 	}
 }
 
+// TestHandleCredsSwap_DeadTargetRefusedUnlessForced covers the spec's
+// "POST /creds/swap on a dead target -> 409, force -> 200".
+func TestHandleCredsSwap_DeadTargetRefusedUnlessForced(t *testing.T) {
+	srv, c, _ := newAutoSwapTestServer(t, false, "orchestrator-myapp")
+	if err := c.markDead("b", "401 on usage fetch (3 consecutive polls)", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	mux := newMux(srv)
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/creds/swap", strings.NewReader(body)))
+		return rec
+	}
+	if rec := post(`{"label":"b"}`); rec.Code != http.StatusConflict {
+		t.Errorf("dead target without force = %d, want 409: %s", rec.Code, rec.Body)
+	}
+	if active, _ := c.ResolveActive(); active != "a" {
+		t.Errorf("a refused swap must not change the active profile, got %q", active)
+	}
+	waitForNudge(t, srv, func() {
+		if rec := post(`{"label":"b","force":true}`); rec.Code != http.StatusOK {
+			t.Fatalf("dead target with force = %d, want 200: %s", rec.Code, rec.Body)
+		}
+	})
+	if active, _ := c.ResolveActive(); active != "b" {
+		t.Errorf("force=true should have swapped to the dead target, active = %q", active)
+	}
+}
+
 func TestResolveServeConfig_CredentialsDefaults(t *testing.T) {
 	// No serve.json in a scratch HOME → defaults.
 	t.Setenv("HOME", t.TempDir())
 	cfg := resolveServeConfig(0)
 	if cfg.Credentials.AutoSwap || cfg.Credentials.MinSwapInterval != credsDefaultMinSwapInterval {
 		t.Errorf("defaults = %+v", cfg.Credentials)
+	}
+	if cfg.Credentials.UsagePollInterval != credsDefaultUsagePollInterval {
+		t.Errorf("usagePollInterval default = %v, want %v", cfg.Credentials.UsagePollInterval, credsDefaultUsagePollInterval)
+	}
+	if cfg.Credentials.SwapAtPercent != credsDefaultSwapAtPercent {
+		t.Errorf("swapAtPercent default = %v, want %v", cfg.Credentials.SwapAtPercent, credsDefaultSwapAtPercent)
+	}
+	if cfg.Credentials.SwapMarginPercent != credsDefaultSwapMarginPercent {
+		t.Errorf("swapMarginPercent default = %v, want %v", cfg.Credentials.SwapMarginPercent, credsDefaultSwapMarginPercent)
+	}
+	if cfg.Credentials.NudgeDelay != credsDefaultNudgeDelay {
+		t.Errorf("nudgeDelay default = %v, want %v", cfg.Credentials.NudgeDelay, credsDefaultNudgeDelay)
+	}
+}
+
+// TestResolveServeConfig_CredentialsClamps verifies serve.json values
+// outside their allowed ranges are clamped rather than accepted verbatim
+// (usagePollInterval below its minimum, swapAtPercent outside 50-100).
+func TestResolveServeConfig_CredentialsClamps(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".config", "tn")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"credentials":{"usagePollInterval":"1s","swapAtPercent":10}}`
+	if err := os.WriteFile(filepath.Join(dir, "serve.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := resolveServeConfig(0)
+	if cfg.Credentials.UsagePollInterval != credsMinUsagePollInterval {
+		t.Errorf("usagePollInterval = %v, want clamped to %v", cfg.Credentials.UsagePollInterval, credsMinUsagePollInterval)
+	}
+	if cfg.Credentials.SwapAtPercent != 50 {
+		t.Errorf("swapAtPercent = %v, want clamped to 50", cfg.Credentials.SwapAtPercent)
 	}
 }
 

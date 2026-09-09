@@ -410,11 +410,18 @@ type statusResponse struct {
 
 // statusCredentials is /status.credentials — see statusResponse.Credentials.
 type statusCredentials struct {
-	AutoSwap        bool               `json:"autoSwap"`
-	MinSwapInterval string             `json:"minSwapInterval"`
-	Active          string             `json:"active"`
-	Profiles        []credsProfileView `json:"profiles"`
-	LastSwap        *credsSwapRecord   `json:"lastSwap,omitempty"`
+	AutoSwap        bool   `json:"autoSwap"`
+	MinSwapInterval string `json:"minSwapInterval"`
+	// UsagePollInterval/SwapAtPercent describe the usage poller's own
+	// config (usage.go); LastPollAt/LastPollError report its most recent
+	// pass — nil/empty before the first pass has completed.
+	UsagePollInterval string             `json:"usagePollInterval,omitempty"`
+	SwapAtPercent     float64            `json:"swapAtPercent,omitempty"`
+	LastPollAt        *time.Time         `json:"lastPollAt,omitempty"`
+	LastPollError     string             `json:"lastPollError,omitempty"`
+	Active            string             `json:"active"`
+	Profiles          []credsProfileView `json:"profiles"`
+	LastSwap          *credsSwapRecord   `json:"lastSwap,omitempty"`
 	// Error is set (and Profiles empty) when the store could not be read
 	// — surfaced rather than hidden so a broken Keychain path reads as
 	// "broken", not as "no profiles saved".

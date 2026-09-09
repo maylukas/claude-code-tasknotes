@@ -78,7 +78,8 @@ cd .. && go build -o ~/bin/tn ./cmd/tn   # picks up whatever is currently in web
 | `internal/tn/bridge.go` | Bridge client (register/inbox/ack/send/agents subcommands) |
 | `internal/tn/note_layout.go` | Structured task-note body layout (ask/brief/description/history blocks, migration) — see `docs/design/SPEC-note-layout.md` |
 | `internal/tn/reaper.go` | Worktree reaper: removes finished `.claude/worktrees/agent-*` worktrees when clean + pushed + unlocked + old enough (never `--force`, branch `-d` only when merged), `/status.worktrees`, `POST /worktrees/reap`, `tn worktrees` — see `docs/design/SPEC-serve.md` "Worktree reaper". Tests build real temp git repos |
-| `internal/tn/creds.go` | claude.ai credential profiles: Keychain abstraction (`keychainStore`, real impl shells out to `/usr/bin/security`), profile save/list/use/rm, usage-limit auto-swap + parked-pane nudge, `GET /creds` / `POST /creds/swap`, `tn creds` CLI — see `docs/design/SPEC-serve.md` "Credential profiles & auto-swap". Tests inject a fake keychain; never call `security` |
+| `internal/tn/creds.go` | claude.ai credential profiles: Keychain abstraction (`keychainStore`, real impl shells out to `/usr/bin/security`), profile save/list/use/rm, dead-profile tracking, swap ordering, the reactive (pane-triggered) auto-swap fallback + parked-pane nudge scheduling, `GET /creds` / `POST /creds/swap`, `tn creds` CLI — see `docs/design/SPEC-usage-swap.md` and `docs/design/SPEC-serve.md`'s "Credential profiles & auto-swap" (superseded pointer). Tests inject a fake keychain; never call `security` |
+| `internal/tn/usage.go` | claude.ai usage-API polling: `usageClient`/`httpUsageClient`, per-profile poll pass (refresh-if-near-expiry, fetch, dead/revive), proactive swap (`maybeProactiveSwap`), settle-then-nudge scheduling (`scheduleNudge`), `POST /creds/poll` — see `docs/design/SPEC-usage-swap.md`. Tests inject a fake `usageClient`; never call `api.anthropic.com`/`platform.claude.com` |
 | `internal/tn/*_test.go` | See conventions above |
 | `webui/` | React + TanStack Router + shadcn/ui SPA (TypeScript, Vite) — `GET /ui`'s content. Own toolchain, own build step (`pnpm build`), never a Go dependency. `webui/embed.go` (package `webui`) exports `Dist embed.FS` (`//go:embed all:dist`), imported by `internal/tn/ui.go` — see Build/test above |
 | `obsidian-plugin/` | Thin Obsidian plugin: an iframe pointed at the daemon's own `/ui`, plus a postMessage bridge for opening vault notes and syncing Obsidian's theme into the iframe — see `docs/design/SPEC-ui-v2.md` |
@@ -108,7 +109,7 @@ cd .. && go build -o ~/bin/tn ./cmd/tn   # picks up whatever is currently in web
 - Dashboard note: `~/Documents/MyVault/Claude Sessions.md` (generated — never edit).
 - Tray-app foundation: `GET /status` (JSON, spectator-safe — never marks messages
   delivered or bumps LastSeenAt) and `GET /ui` (self-contained HTML status page,
-  polls `/status` every 5s). `daemonVersion` (serve.go, currently `"0.7.0"`) is
+  polls `/status` every 5s). `daemonVersion` (serve.go, currently `"0.10.0"`) is
   surfaced by both plus `/health` — bump it whenever you make a notable change to
   either endpoint's shape or the daemon's observable behavior generally.
 

@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.9.1"
+const daemonVersion = "0.10.0"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -438,10 +438,19 @@ type serveFileConfig struct {
 
 // credentialsFileConfig is serve.json's "credentials" block:
 //
-//	"credentials": {"autoSwap": true, "minSwapInterval": "10m"}
+//	"credentials": {
+//	  "autoSwap": true, "minSwapInterval": "10m", "usagePollInterval": "60s",
+//	  "swapAtPercent": 90, "swapMarginPercent": 20, "nudgeDelay": "35s"
+//	}
+//
+// All fields optional; see resolveServeConfig for defaults and clamps.
 type credentialsFileConfig struct {
-	AutoSwap        bool   `json:"autoSwap"`
-	MinSwapInterval string `json:"minSwapInterval,omitempty"`
+	AutoSwap          bool    `json:"autoSwap"`
+	MinSwapInterval   string  `json:"minSwapInterval,omitempty"`
+	UsagePollInterval string  `json:"usagePollInterval,omitempty"`
+	SwapAtPercent     float64 `json:"swapAtPercent,omitempty"`
+	SwapMarginPercent float64 `json:"swapMarginPercent,omitempty"`
+	NudgeDelay        string  `json:"nudgeDelay,omitempty"`
 }
 
 // resolveServeConfig applies precedence: --port flag > env TN_BRIDGE_PORT >
@@ -450,8 +459,14 @@ type credentialsFileConfig struct {
 // disabled.
 func resolveServeConfig(portFlag int) ServeConfig {
 	cfg := ServeConfig{Port: 8391, Projects: map[string]ProjectConfig{},
-		Credentials: CredentialsConfig{MinSwapInterval: credsDefaultMinSwapInterval},
-		Worktrees:   defaultWorktreeReaperConfig()}
+		Credentials: CredentialsConfig{
+			MinSwapInterval:   credsDefaultMinSwapInterval,
+			UsagePollInterval: credsDefaultUsagePollInterval,
+			SwapAtPercent:     credsDefaultSwapAtPercent,
+			SwapMarginPercent: credsDefaultSwapMarginPercent,
+			NudgeDelay:        credsDefaultNudgeDelay,
+		},
+		Worktrees: defaultWorktreeReaperConfig()}
 
 	if home, err := os.UserHomeDir(); err == nil {
 		path := filepath.Join(home, ".config", "tn", "serve.json")
@@ -480,6 +495,32 @@ func resolveServeConfig(portFlag int) ServeConfig {
 					cfg.Credentials.AutoSwap = fc.Credentials.AutoSwap
 					if d, err := time.ParseDuration(fc.Credentials.MinSwapInterval); err == nil && d > 0 {
 						cfg.Credentials.MinSwapInterval = d
+					}
+					if d, err := time.ParseDuration(fc.Credentials.UsagePollInterval); err == nil && d > 0 {
+						if d < credsMinUsagePollInterval {
+							log.Printf("serve: config: credentials.usagePollInterval %s below minimum %s, clamping", d, credsMinUsagePollInterval)
+							d = credsMinUsagePollInterval
+						}
+						cfg.Credentials.UsagePollInterval = d
+					}
+					if fc.Credentials.SwapAtPercent != 0 {
+						p := fc.Credentials.SwapAtPercent
+						if p < 50 || p > 100 {
+							log.Printf("serve: config: credentials.swapAtPercent %v outside 50-100, clamping", p)
+							if p < 50 {
+								p = 50
+							}
+							if p > 100 {
+								p = 100
+							}
+						}
+						cfg.Credentials.SwapAtPercent = p
+					}
+					if fc.Credentials.SwapMarginPercent != 0 {
+						cfg.Credentials.SwapMarginPercent = fc.Credentials.SwapMarginPercent
+					}
+					if d, err := time.ParseDuration(fc.Credentials.NudgeDelay); err == nil && d >= 0 {
+						cfg.Credentials.NudgeDelay = d
 					}
 				}
 			}
@@ -539,6 +580,7 @@ func newMux(s *Server) *http.ServeMux {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /creds", s.handleCredsList)
 	mux.HandleFunc("POST /creds/swap", s.handleCredsSwap)
+	mux.HandleFunc("POST /creds/poll", s.handleCredsPoll)
 	mux.HandleFunc("POST /worktrees/reap", s.handleWorktreesReap)
 	mux.HandleFunc("GET /worktrees", s.handleWorktreesGet)
 	mux.HandleFunc("GET /ui/", s.handleUI)
@@ -572,8 +614,12 @@ func cmdServe(args []string) error {
 	leaveBackgroundTier()
 	srv.creds = newCredsStore(securityCLIKeychain{}, defaultCredsMetaPath())
 	srv.reaper = newWorktreeReaper(cfg.Worktrees)
+	credsSwapSettle = cfg.Credentials.NudgeDelay
+	srv.usageClient = newHTTPUsageClient()
+	srv.startUsagePoller(srv.usageClient)
 	if cfg.Credentials.AutoSwap {
-		log.Printf("serve: credential auto-swap ON (min interval %s) — a usage limit on any orchestrator swaps EVERY Claude session on this machine", cfg.Credentials.MinSwapInterval)
+		log.Printf("serve: credential auto-swap ON (min interval %s, usage poll every %s, swap at %.0f%%) — a usage limit on any orchestrator swaps EVERY Claude session on this machine",
+			cfg.Credentials.MinSwapInterval, cfg.Credentials.UsagePollInterval, cfg.Credentials.SwapAtPercent)
 	}
 
 	tnClient := NewClient(resolveConfig())
