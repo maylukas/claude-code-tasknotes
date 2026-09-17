@@ -30,9 +30,16 @@ for cross-session tracking, not your output channel.
   plus `triage` = parked for a human decision; moving `triage` → `open` = approval
   (routes/starts auto-handling for `claude`-tagged tasks). Human-attention statuses:
   `triage`/`needs-input`/`review`.
-  `needs-input` = waiting on the user's answer (pair with a `**Question:**` note);
+  `needs-input` = a headless agent is waiting on the user's answer (set via `tn ask`);
   `review` = work finished and self-verified, human verification pending — the user
-  normally moves `review` → `done`. Externally blocked: tag `blocked` + note why.
+  normally moves `review` → `done`. Externally blocked: tag `blocked` + `tn brief` what
+  is being waited on and who owns it; keep the task `in-progress`.
+  **An interactive session never sets `triage`, `needs-input`, or `review`.** The user
+  is in the chat with you — ask them there and act on the answer immediately. Those
+  three statuses are how a *headless* session reaches a user who is not present; using
+  them from a session the user is actively talking to puts a question in their Obsidian
+  queue that they already answered in chat. Record the outcome with `tn note`/`tn brief`
+  and set a real status (`in-progress`, `done`).
 - `tn update --tag` REPLACES the whole tag array — repeat all tags the task should keep
   (check current ones with `tn get`).
 - Task id = vault-relative path as printed by `tn list`/`tn create`. Pass it verbatim
@@ -63,8 +70,9 @@ tn stats                                  # board summary
 3. **During work**: create tasks for genuinely new, non-trivial work you discover
    (not sub-steps of the current task). Note decisions, findings, and blockers as they happen —
    notes are the cross-session memory.
-4. **Waiting on the user**: `tn note` the question, `tn status "<path>" needs-input`.
-   Externally blocked: tag `blocked` + note what's needed from whom.
+4. **Waiting on the user**: ask in chat (the user is here); record the answer with
+   `tn note`. Never park an interactive session's task in `needs-input`.
+   Externally blocked: tag `blocked` + `tn brief` what's needed from whom.
 5. **End / handoff**: `tn note` with state, what's verified, and the concrete next step.
    Finished work goes to `review` (user verifies → `done`). Exception: when the task
    belongs to a workstream with an `integration-branch`, verified member work is merged
@@ -91,10 +99,18 @@ such messages:
 
 ```bash
 tn register --name claude/<slug>-<purpose> --project <slug>
+tn drain --name claude/<slug>-<purpose>     # ALWAYS, immediately after register — see below
 tn send [--to AGENT | --project SLUG] [--task "<path>"] [--wait 60] "text"
 tn agents                                  # who is alive
 tn ack --name <name> --msg <id> --response "..."
 ```
+
+**Drain immediately after registering.** A plain `tn register` marks this session as
+*accepting task assignments* for that project: the daemon will route the user's board
+work here instead of to the project's orchestrator, and will not spawn one (live
+incident: an interactive status monitor silently absorbed 8 days of mris assignments).
+`tn drain` keeps the inbox and messaging working and only turns off assignment routing.
+(A `tn register --observer` flag that does this in one step is planned.)
 
 To receive while working, arm one persistent Monitor (never poll via /loop):
 `while true; do tn inbox --name <name> --wait 55 || sleep 5; done` — each event line is

@@ -21,6 +21,43 @@ and questions printed as normal output are lost. Therefore:
 - **Questions**: `tn ask "<path>" "<question>"` writes the Needs-you block AND sets
   `needs-input` in one call — use it instead of a `**Question:**` note plus a status
   change. On reply the block clears automatically; answer in the brief and history.
+  **The user's attention is the scarcest resource in this system. Before you ask, all
+  four must hold — otherwise it is not an ask:**
+  1. The answer requires authority or judgement you do not have (spend, credentials,
+     product/clinical risk, a regulated severity call). If more investigation would
+     settle it, investigate. A failing test is not a question until you have run it
+     **3 times** and can say flake or defect.
+  2. **No open ask already covers this decision.** Check first:
+     `tn list --status needs-input --project <P>`. If one does, that task is the
+     umbrella — set `--blocked-by "<umbrella-path>"` on yours and keep working. One
+     decision, one task: 8 tasks asking for the same credential is one decision
+     rendered 8 times, and the user answers it 8 times or ignores it 8 times.
+  3. It is not a status report and not "please merge". Those go in `tn brief`
+     (see Completion), never in an ask.
+  4. Waiting on an external event — a rebuild, an outage, another team, a fleet coming
+     back — is **not** a question. Tag `blocked`, `tn brief` what is being waited on and
+     who owns it, and leave the task `in-progress`. Only ask when the user is the one
+     who must act.
+  **Ask format — one sentence, then options, then a default:**
+  ```
+  <One-sentence question ending in "?">
+  (a) <option>  (b) <option>   Recommend: <a|b> because <≤15 words>.
+  If no answer by <YYYY-MM-DD>: <the default action you will take>.
+  ```
+  Evidence and reasoning go in history, not in the ask. The default is not a
+  formality — you WILL take it on that date and note that you did. An ask with no
+  default is an ask you are willing to block forever on; say so explicitly if that is
+  genuinely the case.
+  **Ask budget: at most 3 open `needs-input` tasks per project.** At the cap, first
+  consolidate — if an open ask covers the same decision, use `--blocked-by` and keep
+  working. If the question is genuinely distinct and the cap is full, still write the
+  ask block, but tag `blocked` and leave the task `in-progress` as a QUEUED ask; promote
+  it to `needs-input` when a slot frees. A fourth simultaneous question does not get
+  answered faster; it makes the first three harder to find. Never silently drop a
+  question because the budget is full. **The cap counts only asks created on or after
+  2026-09-09.** Asks that already exist are drained by the user and by consolidation, not
+  by reclassification — do not convert an existing `needs-input` task to `blocked` just to
+  get under the cap.
 - **Answers to user messages**: `tn ack --response "<the answer>"` is enough — the bridge
   now mirrors any ack response onto its task's history automatically, attributed to you,
   so the user sees it in Obsidian without you writing it twice. Put the actual answer in
@@ -42,6 +79,14 @@ and questions printed as normal output are lost. Therefore:
   rubber-stamps is how the genuinely blocking items get lost.
   Before setting `review`, name the artifact in one clause. If you cannot, it is `done` — the user verifies and moves it to `done` themselves.
   Set `done` directly only for trivial mechanical tasks with nothing to verify.
+  **"Merged, awaiting your merge" and "here is what happened" are not asks.** If work is
+  finished and something remains for the user to merge or judge, that is `review` with
+  the artifact named — never `needs-input`. If nothing remains for them, it is `done`. A
+  task whose ask block reads as a progress report has mislabelled a brief as a question,
+  and it sits in the user's decision queue costing exactly as much attention as a real one.
+  **When your own question stops being live — the MR merged, the blocker cleared, events
+  moved past it — do not leave the task parked waiting for the user to notice.**
+  `tn ask --clear`, brief the new state, and move the task to its real status yourself.
 - **Integration branch**: the default MR target is the repo's normal base branch
   (`development`). But when a task carries an `integration-branch` field, EVERY MR for
   that task targets that branch instead — one consolidated, reviewable MR per workstream
@@ -220,8 +265,13 @@ not announce itself as obligingly.
   Instruct every subagent to write its own findings/progress directly to the task
   (`tn note "<path>" "..." --by <subagent-name>`) and to RETURN to you only a one-line
   verdict (done / blocked / needs-input + reason) — results must never be relayed
-  through your context. Status transitions and user communication stay yours; read the
-  task with `tn get` only when you actually need the detail.
+  through your context. **Checkpoint findings BEFORE any long build or test**: every
+  subagent must `tn note` what it has established the moment it is established, and always
+  before it launches a slow build/test — so a strand costs only the final verdict, never
+  the investigation behind it. A worker must never carry results solely in its own context
+  across a long-running command (decided 2026-09-09). Status transitions and user
+  communication stay yours; read the task with `tn get` only when you actually need the
+  detail.
 - **User message** (`@claude:` line) → act on it in the task's context, then
   — a reply on a `review` task is a review rejection: set it back to `in-progress`
   and address it before anything else on that task —
@@ -357,6 +407,19 @@ container names and published ports are global while worktrees are not.
   the PID at launch and match on that. A peer's identical command is indistinguishable
   otherwise, and a worker that adopts a peer's job will wait on something it does not
   own — which is how this turns into the background-job deadlock above.
+- **Long verification runs on the pushed branch, not blocked inside the worker (decided
+  2026-09-09).** A worker's job is edit-and-push; it does not sit blocked on a full
+  build/test in its worktree — that is how workers strand and burn a slot for nothing.
+  When a task needs a heavy build/test to verify, the worker commits, pushes its branch,
+  and returns `pushed — needs verify`; YOU (or a dedicated verification subagent) run the
+  long build on that pushed branch — the same model you already use to verify a member
+  branch before merging. A stranding worker then loses only a re-runnable build, and the
+  verdict is reproducible on shared infra instead of trapped in a worktree. Agent builds
+  also need the machine-scoped TLS trust in place — `~/.mavenrc` with
+  `-Djavax.net.ssl.trustStoreType=KeychainStore` for Maven, and `NODE_EXTRA_CA_CERTS`
+  pointing at the medavis CA bundle for bun — or a build that has to fetch a fresh
+  dependency strands on a PKIX / `UNABLE_TO_GET_ISSUER_CERT` TLS failure (fixed on this
+  machine 2026-09-09).
 - **GitLab is the most shared resource here, and the one where a collision is visible to
   the whole team.** A live incident (2026-08-25) shows worktree isolation is no defence
   against it: a task got reassigned while the previous generation's worker was still
@@ -531,8 +594,17 @@ never just a note in your context or a teammate message:
 - **Followups** (an experiment to finish, a hypothesis to verify, flaky infra to
   observe, or work you're intentionally deferring past this task): task with tag
   `agent`, details = current state + concrete next step.
-- **Improvements** (tooling/process insights worth acting on): task with tags
-  `agent` + `improvement`, no `claude`, status `triage` — the user decides these.
+- **Improvements to the PRODUCT** (tooling/process insight about the repo you are working
+  in): task with tags `agent` + `improvement`, no `claude`, status `triage` — the user
+  decides these.
+- **Findings about the AGENT HARNESS ITSELF** — the bridge daemon, `tn`, spawning,
+  worktrees, tmux, this contract, the dashboard, worker lifecycle — go to the
+  `tasknotes-cli` project, NEVER to the product project:
+  `tn create --claude-project tasknotes-cli --project "[[tasknotes-cli]]" --tag agent --tag improvement --status triage …`
+  The tell: if the fix would be a change to `tn`'s source or to this file rather than to
+  the product's code, it is a harness finding. These are real and worth filing — but they
+  are a different queue with a different reader, and mixing them into a product board
+  means the person triaging product work pays attention to neither cleanly.
 
 **Use `--blocked-by` when the follow-up genuinely continues from this task**, not just a
 `[[wikilink]]` mention — a dependency is structural (it shows on the board, blocks
@@ -594,7 +666,11 @@ long-lived session and this contract evolves under you).
   Human-attention statuses are exactly `triage`/`needs-input`/`review` — never leave
   something needing the user in `open`. `needs-input` = waiting on the user mid-task;
   `review` = finished, awaiting human verification.
-  Externally blocked (dependency, outage): tag `blocked` + note why.
+  Externally blocked (dependency, outage, waiting on another team or a rebuild):
+  tag `blocked`, `tn brief` WHAT is being waited on and WHO owns it, and leave the task
+  `in-progress` — do NOT use `needs-input` to make a wait visible. `needs-input` means
+  the USER must act; `blocked` means someone or something else must. Re-check a blocked
+  task on every rescan and clear the tag the moment the wait ends.
 - **Closing a task does not close what it was blocking.** When you resolve or close a
   task, re-examine every task `blockedBy` it — "the blocker is done" and "the thing it
   was gating is now actually possible" are different claims, and treating them as one
@@ -742,3 +818,14 @@ which entry is missing — don't guess or hardcode one.
   `-pl X` run WITHOUT `-am` proves nothing about a change to X's upstream. The tell is a
   visibility/missing-symbol error that a whole-reactor `compile test-compile` does not
   reproduce.
+
+- **Testcontainers ITs on mris-backend do NOT need the registry — unless you let the classpath
+  pin decide.** `test-common/src/main/resources/testcontainers.properties` sets
+  `pull.policy=AlwaysPullPolicy`, so with the VPN down every IT fails at container start with
+  `ContainerFetchException … repo.medavis.local/medavis/ris-db-postgresql-linux:develop` after a
+  2-minute wait, even though the image is cached locally. The shell env var
+  `TESTCONTAINERS_PULL_POLICY=org.testcontainers.images.DefaultPullPolicy` is resolved AHEAD of
+  the classpath property and makes cached images usable offline (found by dpc-e3-2/dpc-e3-3,
+  2026-09-09). Export it for offline IT runs; do not edit the properties file for it. Also clear
+  `<module>/target/failsafe-reports` before re-running after a container-start failure — the
+  stale reports make a later `failsafe:verify` in that module fail even when nothing ran.
