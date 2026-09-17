@@ -164,6 +164,14 @@ func (s *Server) reconcileSpawnsOnce() {
 	var kills []spawnKill
 	s.mu.Lock()
 	paused := s.state.SpawnPaused
+	// changed tracks whether this pass actually wrote to s.state, so an
+	// idle daemon (no tracked generations to evaluate, no new spawn
+	// decided) doesn't rewrite state.json every reconcilerInterval tick
+	// for nothing. len(trackedSessions) > 0 means
+	// evaluateSpawnEvidenceLocked is about to touch at least one entry's
+	// Pending/LastCheckedAt (and possibly resolve/kill/fail it) even when
+	// nothing is ultimately decided below.
+	changed := len(trackedSessions) > 0
 	kills = s.evaluateSpawnEvidenceLocked(snapshot, time.Now())
 	for _, pe := range autoSpawnProjects {
 		slug, cfg := pe.slug, pe.cfg
@@ -213,9 +221,12 @@ func (s *Server) reconcileSpawnsOnce() {
 		if !paused {
 			s.recordSpawnIntentLocked(slug)
 			s.recordSpawnedGenerationLocked(slug, agentName, tmuxSession, time.Now())
+			changed = true
 		}
 	}
-	s.saveLocked()
+	if changed {
+		s.saveLocked()
+	}
 	s.mu.Unlock()
 
 	// Kills run outside the lock, same as spawns below.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -516,6 +517,26 @@ var errFakeTmuxSnapshot = &fakeSnapshotError{"simulated tmux failure"}
 type fakeSnapshotError struct{ msg string }
 
 func (e *fakeSnapshotError) Error() string { return e.msg }
+
+// TestReconcileSpawnsOnce_IdleTickDoesNotWriteState verifies a genuinely
+// idle reconciler pass (no tracked generations to evaluate, no queued
+// work, nothing decided) never calls saveLocked — an idle daemon must not
+// rewrite state.json every reconcilerInterval (30s) tick for nothing.
+func TestReconcileSpawnsOnce_IdleTickDoesNotWriteState(t *testing.T) {
+	srv, _, _, calls := newSpawnEvidenceTestServer(t,
+		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}})
+	// Deliberately nothing queued and no tracked generations — a pass with
+	// nothing whatsoever for the reconciler to do.
+
+	srv.reconcileSpawnsOnce()
+
+	if len(*calls) != 0 {
+		t.Fatalf("expected no spawn on a genuinely idle tick, got %d", len(*calls))
+	}
+	if _, err := os.Stat(srv.statePath); !os.IsNotExist(err) {
+		t.Errorf("expected state.json to never be written by an idle tick, got stat err=%v", err)
+	}
+}
 
 // TestHandleSpawnPause_UnpauseClearsSpawnFailures verifies POST
 // /spawn/pause {"paused":false} clears every project's consecutive-failure
