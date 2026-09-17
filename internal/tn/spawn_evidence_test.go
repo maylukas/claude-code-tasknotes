@@ -275,6 +275,51 @@ func TestSpawnEvidence_FreshEntryWithinGrace_BlocksSpawn_NeverKilled(t *testing.
 	}
 }
 
+// TestSpawnEvidence_SemverPaneCommand_PendingNotKilled directly guards the
+// versioned-symlink pane-detection bug fixed in paneHasLiveClaude/
+// claudePaneVersionPattern (spawn.go): tmux reports a claude binary
+// resolved through ~/.local/bin/claude's versioned-symlink layout as a
+// bare version string (e.g. "2.1.266"), not "claude"/"node" — confirmed
+// live. A healthy orchestrator whose pane reports exactly that shape must
+// be treated as alive and stay Pending well within spawnRegisterDeadline,
+// not killed as "no claude process running" by the very mechanism meant
+// to protect a slow-to-register-but-healthy generation.
+func TestSpawnEvidence_SemverPaneCommand_PendingNotKilled(t *testing.T) {
+	if !paneHasLiveClaude([]string{"2.1.266"}) {
+		t.Fatal("sanity check failed: paneHasLiveClaude must report a bare semver pane as live claude (see TestPaneHasLiveClaude)")
+	}
+
+	srv, snap, kill, calls := newSpawnEvidenceTestServer(t,
+		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}})
+	seedQueuedOrchestratorMessage(srv, "orchestrator-myapp")
+
+	srv.reconcileSpawnsOnce()
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(*calls))
+	}
+	gen1 := (*calls)[0]
+
+	// What realSpawnSnapshot would actually compute for a pane reporting
+	// "2.1.266": Exists true, LiveClaude true (via paneHasLiveClaude).
+	snap.set(gen1.tmuxSession, spawnSnapshotEntry{Exists: true, LiveClaude: true})
+	backdateSpawnedGeneration(t, srv, "myapp", gen1.tmuxSession, 5*time.Minute)
+
+	srv.reconcileSpawnsOnce()
+
+	if len(*calls) != 1 {
+		t.Fatalf("expected the healthy-but-slow-to-register generation to stay Pending at 5min (well within spawnRegisterDeadline), got %d total spawns", len(*calls))
+	}
+	if got := kill.sessions(); len(got) != 0 {
+		t.Fatalf("expected no kill for a generation with a live semver-reporting pane, got %v", got)
+	}
+	srv.mu.Lock()
+	tracked := srv.state.SpawnedGenerations["myapp"]
+	srv.mu.Unlock()
+	if len(tracked) != 1 || !tracked[0].Pending {
+		t.Errorf("expected the entry to remain tracked and Pending, got %+v", tracked)
+	}
+}
+
 // indexOfSpawnedGeneration is a small test-only lookup helper.
 func indexOfSpawnedGeneration(entries []SpawnedGeneration, tmuxSession string) (int, bool) {
 	for i, g := range entries {

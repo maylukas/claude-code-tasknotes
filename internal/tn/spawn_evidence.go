@@ -280,6 +280,12 @@ func (s *Server) logSpawnSuspendedLocked(slug string, now time.Time) {
 		s.spawnSuspendLoggedAt = map[string]time.Time{}
 	}
 	s.spawnSuspendLoggedAt[slug] = now
-	log.Printf("serve: spawn SUSPENDED for %s: %d consecutive orchestrators never registered (last: %s); fix the cause then POST /spawn/pause {\"paused\":false} or restart",
+	// Deliberately does NOT say "or restart": SpawnFailures is persisted
+	// state (see State.SpawnFailures' doc comment), so a daemon restart
+	// does NOT clear a suspension — only a matching registration or an
+	// explicit POST /spawn/pause {"paused":false} does. Saying otherwise
+	// would be actively misleading to whoever reads this line at 3am and
+	// restarts the daemon expecting it to help.
+	log.Printf("serve: spawn SUSPENDED for %s: %d consecutive orchestrators never registered (last: %s); fix the cause then POST /spawn/pause {\"paused\":false} to resume (a daemon restart alone will NOT clear this)",
 		slug, s.state.SpawnFailures[slug], s.spawnLastFailedSession[slug])
 }

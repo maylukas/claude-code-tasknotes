@@ -161,6 +161,23 @@ func TestPaneHasLiveClaude(t *testing.T) {
 		{"node present", []string{"node"}, true},
 		{"neither present", []string{"zsh", "bash"}, false},
 		{"empty", nil, false},
+		// A claude binary resolved through the versioned-symlink layout
+		// (~/.local/bin/claude -> ~/.local/share/claude/versions/<semver>)
+		// reports its resolved executable's basename, not "claude"/"node"
+		// — confirmed live on this machine. See claudePaneCommands' doc
+		// comment.
+		{"bare semver", []string{"2.1.266"}, true},
+		{"semver with prerelease suffix", []string{"2.1.274-beta.1"}, true},
+		{"semver among other panes", []string{"zsh", "2.1.266"}, true},
+		{"plain shell-ish pane", []string{"-zsh"}, false},
+		{"bash", []string{"bash"}, false},
+		{"blank pane string", []string{""}, false},
+		// Must require at least MAJOR.MINOR.PATCH — a bare number or a
+		// two-part version is never what tmux actually reports for this
+		// binary, and treating it as "definitely claude" would be a guess,
+		// not evidence.
+		{"bare number, not a version", []string{"10"}, false},
+		{"two-part version, not enough dots", []string{"1.2"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

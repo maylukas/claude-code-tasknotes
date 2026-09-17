@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -135,13 +136,40 @@ type tmuxNewSessionFunc func(session, cwd string) error
 // claude CLI is actually running in a pane: "claude" when invoked
 // directly, or "node" since the claude CLI is a node script and tmux may
 // report the interpreter rather than the wrapper name.
+//
+// A THIRD shape exists and is the common one in practice: when `claude` is
+// resolved via ~/.local/bin/claude (see defaultSpawnFunc), that path is
+// itself a symlink into ~/.local/share/claude/versions/<semver>, and tmux's
+// pane_current_command reports the resolved EXECUTABLE's basename — i.e.
+// the version string itself (confirmed live: a running orchestrator's pane
+// reports "2.1.266"), not "claude" or "node" at all. Missing this meant
+// paneHasLiveClaude reported false for every healthy orchestrator on this
+// machine, which the spawn-evidence pass (spawn_evidence.go) would then
+// kill as "no claude process running" the moment it aged past
+// spawnStartupGrace — a healthy-but-still-starting orchestrator getting
+// torn down by the very mechanism meant to protect it. See
+// claudePaneCommandIsVersion below.
 var claudePaneCommands = map[string]bool{"claude": true, "node": true}
 
+// claudePaneVersionPattern matches a bare semver-ish version string (the
+// resolved claude binary's basename — see claudePaneCommands' doc
+// comment), e.g. "2.1.266" or "2.1.274-beta.1". Anchored at the start only
+// (not the end) so a build/prerelease suffix doesn't need to be
+// enumerated; anchored at the start so a plain integer/short number like
+// "10" or a partial "1.2" — neither of which tmux would ever actually
+// report for this binary, but neither of which should be treated as
+// "definitely claude" either — does NOT match (requires at least
+// MAJOR.MINOR.PATCH).
+var claudePaneVersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+`)
+
 // paneHasLiveClaude reports whether any pane's current command looks like
-// a running claude process.
+// a running claude process — "claude"/"node" (claudePaneCommands) or a
+// bare version string (claudePaneVersionPattern), the shape tmux reports
+// for a claude binary resolved through the versioned-symlink layout.
 func paneHasLiveClaude(panes []string) bool {
 	for _, p := range panes {
-		if claudePaneCommands[strings.TrimSpace(p)] {
+		p = strings.TrimSpace(p)
+		if claudePaneCommands[p] || claudePaneVersionPattern.MatchString(p) {
 			return true
 		}
 	}
