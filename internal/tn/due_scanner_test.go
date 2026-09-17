@@ -45,7 +45,7 @@ func newDueScannerTestServer(t *testing.T, projects map[string]ProjectConfig) *S
 	t.Helper()
 	dir := t.TempDir()
 	cfg := ServeConfig{Port: 0, Projects: projects}
-	return newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string) error { return nil })
+	return newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 }
 
 func queuedMessagesTo(srv *Server, to string) []*Message {

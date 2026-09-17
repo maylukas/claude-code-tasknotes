@@ -16,7 +16,7 @@ import (
 // temp vault (DashboardPath set so repoSettingsFor can find
 // <vault>/Repos/<slug>.md), for tests exercising repo-note-driven
 // parallelism behavior.
-func newParallelismTestServer(t *testing.T, projects map[string]ProjectConfig, spawnFunc func(project, cwd string, env map[string]string) error) *Server {
+func newParallelismTestServer(t *testing.T, projects map[string]ProjectConfig, spawnFunc func(project, cwd string, env map[string]string, agentName, tmuxSession string) error) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	vaultDir := filepath.Join(dir, "vault")
@@ -75,7 +75,7 @@ func TestReconcileSpawnsOnce_ScaleOutWhenSaturated(t *testing.T) {
 	var callCount int
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -107,7 +107,7 @@ func TestReconcileSpawnsOnce_NoScaleOutWhenNotSaturated(t *testing.T) {
 	var callCount int
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -138,7 +138,7 @@ func TestReconcileSpawnsOnce_ScaleOutCappedAtMaxOrchestrators(t *testing.T) {
 	var callCount int
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -168,7 +168,7 @@ func TestReconcileSpawnsOnce_SpawnOnPendingWorkWithEmptyQueue(t *testing.T) {
 	var callCount int
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -192,7 +192,7 @@ func TestReconcileSpawnsOnce_NoSpawnWhenNothingRoutable(t *testing.T) {
 	var callCount int
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -266,13 +266,13 @@ func TestSpawnOrchestrator_RepoNoteMaxWorkersOverridesServeJSON(t *testing.T) {
 			Env: map[string]EnvEntry{"TN_MAX_WORKERS": {Value: "2"}},
 		},
 	}
-	srv := newParallelismTestServer(t, projects, func(project, cwd string, env map[string]string) error {
+	srv := newParallelismTestServer(t, projects, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		gotEnv = env
 		return nil
 	})
 	writeRepoNote(t, srv, "myapp", 0, 5)
 
-	srv.spawnOrchestrator("myapp", "/repos/myapp")
+	srv.spawnOrchestrator("myapp", "/repos/myapp", "orchestrator-myapp-g1", "tn-myapp-g1")
 
 	if gotEnv["TN_MAX_WORKERS"] != "5" {
 		t.Errorf("expected repo-note max-workers (5) to override serve.json's (2), got %q", gotEnv["TN_MAX_WORKERS"])
@@ -290,13 +290,13 @@ func TestSpawnOrchestrator_ServeJSONMaxWorkersKeptWhenNoRepoNoteOverride(t *test
 			Env: map[string]EnvEntry{"TN_MAX_WORKERS": {Value: "2"}},
 		},
 	}
-	srv := newParallelismTestServer(t, projects, func(project, cwd string, env map[string]string) error {
+	srv := newParallelismTestServer(t, projects, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		gotEnv = env
 		return nil
 	})
 	// No repo note written at all — defaults, no max-workers override.
 
-	srv.spawnOrchestrator("myapp", "/repos/myapp")
+	srv.spawnOrchestrator("myapp", "/repos/myapp", "orchestrator-myapp-g1", "tn-myapp-g1")
 
 	if gotEnv["TN_MAX_WORKERS"] != "2" {
 		t.Errorf("expected serve.json's TN_MAX_WORKERS (2) kept, got %q", gotEnv["TN_MAX_WORKERS"])

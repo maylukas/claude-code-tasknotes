@@ -17,7 +17,7 @@ func TestSpawnIntent_BothPathsDecideSameWindow_OnlyOneSpawn(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -49,7 +49,7 @@ func TestSpawnIntent_ExpiryAllowsLaterLegitimateSpawn(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -125,10 +125,12 @@ func TestSpawnIntent_MaxOrchestratorsTwoAllowsTwoSequentialSpawns(t *testing.T) 
 	apiSrv := fakeStartableTasksAPI(t, tasks)
 
 	var callCount int
+	var gotAgentNames []string
 	srv := newParallelismTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
+			gotAgentNames = append(gotAgentNames, agentName)
 			return nil
 		})
 	srv.tnClient = NewClient(Config{URL: apiSrv.URL})
@@ -143,10 +145,15 @@ func TestSpawnIntent_MaxOrchestratorsTwoAllowsTwoSequentialSpawns(t *testing.T) 
 		t.Fatalf("expected 1 spawn for the initial generation, got %d", callCount)
 	}
 
-	// Generation 1 registers, clearing its intent.
+	// Generation 1 registers (under whatever identity the reconciler
+	// actually computed — newGenerationIdentity is time-based, so it
+	// won't literally be "orchestrator-myapp-g1"), clearing both its
+	// intent AND its tracked SpawnedGenerations entry (see
+	// clearSpawnedGenerationLocked) — the entry must be cleared for the
+	// scale-out math below to see the right accepting count.
 	ts := httptest.NewServer(newMux(srv))
 	defer ts.Close()
-	register(t, ts, "orchestrator-myapp-g1", "myapp")
+	register(t, ts, gotAgentNames[0], "myapp")
 
 	// Second decision: one accepting agent, backlog saturated relative to
 	// max-workers=1 (3 startable > 1*1) and still under max-orchestrators=2

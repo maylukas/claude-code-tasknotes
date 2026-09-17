@@ -139,7 +139,7 @@ func TestHandleProjectsEnv_SingleProjectNeverReturnsValues(t *testing.T) {
 			},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error { return nil })
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 
 	resp, err := http.Get(ts.URL + "/projects/env?project=myapp")
 	if err != nil {
@@ -197,7 +197,7 @@ func TestHandleProjectsEnv_NoProjectListsAll(t *testing.T) {
 			"foo":   {Env: map[string]EnvEntry{"B": {Description: "advisory"}}},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error { return nil })
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 
 	resp, err := http.Get(ts.URL + "/projects/env")
 	if err != nil {
@@ -234,7 +234,7 @@ func TestCmdEnvWiring(t *testing.T) {
 			}},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error { return nil })
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 
 	b := NewBridgeClient(ts.URL)
 	body, err := b.ProjectsEnv("myapp")

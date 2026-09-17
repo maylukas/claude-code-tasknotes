@@ -24,7 +24,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.10.0"
+const daemonVersion = "0.10.1"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -272,6 +272,39 @@ type State struct {
 	// effectiveAcceptingCountLocked, recordSpawnIntentLocked,
 	// clearSpawnIntentLocked.
 	PendingSpawns map[string]time.Time `json:"pendingSpawns"`
+	// SpawnedGenerations maps a project slug to every tracked spawned
+	// generation for it that hasn't yet been resolved by EVIDENCE (a
+	// registration, or a tmux snapshot showing the session is gone/dead —
+	// see evaluateSpawnEvidenceLocked in spawn_evidence.go). This is what
+	// actually fixes the spawn-loop incident PendingSpawns/spawnIntentTTL
+	// alone could not: an entry stays tracked (and keeps counting toward
+	// effectiveAcceptingCountLocked, suppressing further spawns) for as
+	// long as its tmux session is alive with a claude process in it, no
+	// matter how long that takes to register — PendingSpawns' fixed
+	// spawnIntentTTL clock expired regardless of whether the spawn was
+	// actually still in flight, which is exactly what let 232 orchestrator
+	// sessions pile up overnight (each blocked on a macOS keychain prompt
+	// before it could reach `tn register`, invisible to any liveness
+	// check, respawned every ~3.5min once the old clock ran out). An entry
+	// is removed the moment it's resolved: a matching registration
+	// (handleRegister), or the reconciler's evidence pass concluding the
+	// session is gone/dead/never-registered-in-time (recording a
+	// SpawnFailures[slug] increment when it is). See spawnStartupGrace,
+	// spawnRegisterDeadline, maxConsecutiveSpawnFailures.
+	SpawnedGenerations map[string][]SpawnedGeneration `json:"spawnedGenerations"`
+	// SpawnFailures counts, per project slug, CONSECUTIVE spawned
+	// generations that were resolved as failures (never registered before
+	// being killed — see evaluateSpawnEvidenceLocked) without an
+	// intervening successful registration. Reset to 0 by a successful
+	// registration for the slug (handleRegister) or by a human explicitly
+	// resuming spawning via POST /spawn/pause {"paused":false}
+	// (handleSpawnPause) — deliberately NOT reset by a daemon restart
+	// alone, since this is persisted state and a restart silently
+	// forgiving a genuinely broken project would defeat the point of the
+	// cap. At maxConsecutiveSpawnFailures, both spawn paths
+	// (resolveTargetLocked, reconcileSpawnsOnce) refuse to spawn that
+	// slug and log a throttled warning (logSpawnSuspendedLocked) instead.
+	SpawnFailures map[string]int `json:"spawnFailures"`
 	// CreatedTasks maps a client-supplied idempotency key (`tn create`'s
 	// hash of title+claude-project+details) to the task it created —
 	// makes a `tn create` retry after a client-side timeout harmless
@@ -324,6 +357,30 @@ type State struct {
 	// for an unseen key (time.Time{}) means "list everything", same as an
 	// absent MRStates/MRReviews entry meaning "never observed".
 	MRCursors map[string]time.Time `json:"mrCursors"`
+}
+
+// SpawnedGeneration is one tracked, not-yet-resolved spawned orchestrator
+// generation — see State.SpawnedGenerations.
+type SpawnedGeneration struct {
+	// TmuxSession/AgentName are the generation's identity, computed once
+	// at spawn-DECISION time (newGenerationIdentity) — the same values
+	// passed into spawnFunc and, in the real spawn, registered by the
+	// spawned session itself (see handleRegister's matching).
+	TmuxSession string    `json:"tmuxSession"`
+	AgentName   string    `json:"agentName"`
+	SpawnedAt   time.Time `json:"spawnedAt"`
+	// Pending is this entry's most recent evidence verdict (see
+	// evaluateSpawnEvidenceLocked) — true means "still counts as an
+	// outstanding spawn," set on every reconciler tick that doesn't
+	// resolve the entry one way or the other. Read by
+	// effectiveAcceptingCountLocked. Also true immediately on creation
+	// (before any tick has evaluated it), matching the age<spawnStartupGrace
+	// grace period's own verdict.
+	Pending bool `json:"pending"`
+	// LastCheckedAt is when Pending was last set — informational only
+	// (not currently read by any decision), kept for observability if
+	// this ever needs debugging from a state.json dump.
+	LastCheckedAt time.Time `json:"lastCheckedAt"`
 }
 
 // workerEntry is one declared worker subtask under an owning agent.
@@ -606,10 +663,12 @@ func cmdServe(args []string) error {
 	log.Printf("serve: orchestrator contract: %s", orchestratorDoc)
 
 	var srv *Server
-	srv = newServer(defaultStatePath(), cfg, func(project, cwd string, env map[string]string) error {
-		return defaultSpawnFunc(project, cwd, env, srv.sessionAlive, srv.orchestratorDoc)
+	srv = newServer(defaultStatePath(), cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
+		return defaultSpawnFunc(project, cwd, env, agentName, tmuxSession, srv.sessionAlive, srv.orchestratorDoc)
 	})
 	srv.orchestratorDoc = orchestratorDoc
+	srv.spawnSnapshotFunc = realSpawnSnapshot
+	srv.spawnKillFunc = realKillSpawnedSession
 
 	leaveBackgroundTier()
 	srv.creds = newCredsStore(securityCLIKeychain{}, defaultCredsMetaPath())

@@ -14,7 +14,7 @@ func TestReconcileSpawnsOnce_PausedSkipsSpawn(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -46,7 +46,7 @@ func TestSpawnOrchestrator_PausedSkipsSpawn(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -54,7 +54,7 @@ func TestSpawnOrchestrator_PausedSkipsSpawn(t *testing.T) {
 	srv.state.SpawnPaused = true
 	srv.mu.Unlock()
 
-	srv.spawnOrchestrator("myapp", "/repos/myapp")
+	srv.spawnOrchestrator("myapp", "/repos/myapp", "orchestrator-myapp-g1", "tn-myapp-g1")
 
 	if callCount != 0 {
 		t.Errorf("expected spawnOrchestrator itself to skip while paused, got %d calls", callCount)

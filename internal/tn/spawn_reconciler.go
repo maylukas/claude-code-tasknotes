@@ -65,30 +65,42 @@ func buildStartableOpenTasksQuery() FilterGroup {
 const defaultMaxWorkers = 3
 
 // reconcileSpawnsOnce is a single reconciler pass, factored out of the
-// ticker loop so it's directly testable. For every configured autoSpawn
-// project, spawns a new generation when EITHER:
-//   - no alive ACCEPTING agent exists (matched case-insensitively, a
+// ticker loop so it's directly testable. It runs in three phases:
+//
+//  1. Evidence: snapshot tmux ONCE, outside the lock (tmux execs are slow
+//     syscalls that must never run while s.mu is held — see
+//     spawnSnapshotFunc), for every currently-tracked SpawnedGenerations
+//     session across every slug. Then, under the lock, apply that snapshot
+//     to resolve or keep-pending every tracked entry — see
+//     evaluateSpawnEvidenceLocked. This is what replaces the old fixed
+//     spawnIntentTTL clock as the thing bounding "spawned but never
+//     registered" (see State.SpawnedGenerations' doc comment).
+//  2. Decision: for every configured autoSpawn project, spawn a new
+//     generation when EITHER:
+//     - no alive ACCEPTING agent exists (matched case-insensitively, a
 //     draining-only generation doesn't count, per SPEC-generations.md) AND
 //     there's routable work — a queued message addressed to
 //     orchestrator-<slug> (the original trigger) OR a startable open
 //     claude-tagged task (so a draining orchestrator plus an idle-but-
 //     nonempty open queue no longer deadlocks waiting for an external
 //     event); OR
-//   - the accepting count is below the project's max-orchestrators (repo
+//     - the accepting count is below the project's max-orchestrators (repo
 //     note, default 1) AND the startable-task backlog exceeds what the
 //     current accepting generations can plausibly keep up with
 //     (acceptingCount * effective max-workers) — scale out another.
+//     A slug at maxConsecutiveSpawnFailures is refused regardless (see
+//     logSpawnSuspendedLocked).
+//  3. Apply: kills (phase 1's resolved-as-failure entries) and spawns
+//     (phase 2's candidates) both run outside the lock.
 //
 // The startable-task count comes from ONE global TaskNotes query (see
 // buildStartableOpenTasksQuery), skipped entirely when no project is
 // autoSpawn or s.tnClient is nil; a query failure just degrades both new
 // triggers to "no startable work known" (falls back to the original
-// queued-message-only behavior) rather than blocking the pass. Spawns run
-// outside the lock.
+// queued-message-only behavior) rather than blocking the pass.
 func (s *Server) reconcileSpawnsOnce() {
 	type spawnCandidate struct {
-		slug string
-		cwd  string
+		slug, cwd, agentName, tmuxSession string
 	}
 	type projectEntry struct {
 		slug string
@@ -100,6 +112,12 @@ func (s *Server) reconcileSpawnsOnce() {
 	for slug, cfg := range s.config.Projects {
 		if cfg.AutoSpawn {
 			autoSpawnProjects = append(autoSpawnProjects, projectEntry{slug, cfg})
+		}
+	}
+	var trackedSessions []string
+	for _, entries := range s.state.SpawnedGenerations {
+		for _, g := range entries {
+			trackedSessions = append(trackedSessions, g.TmuxSession)
 		}
 	}
 	s.mu.Unlock()
@@ -125,9 +143,28 @@ func (s *Server) reconcileSpawnsOnce() {
 		}
 	}
 
+	// Phase 1 (evidence): snapshot tmux for every tracked session, once,
+	// before touching s.mu. snapshotFn is nil in tests that never wire one
+	// (newServer leaves it nil; only cmdServe sets the real one) — treated
+	// identically to a snapshot error: every tracked entry stays Pending,
+	// nothing gets killed this tick. See spawnSnapshotFunc's doc comment.
+	var snapshot map[string]spawnSnapshotEntry
+	if len(trackedSessions) > 0 {
+		if s.spawnSnapshotFunc == nil {
+			snapshot = nil
+		} else if snap, err := s.spawnSnapshotFunc(trackedSessions); err != nil {
+			log.Printf("serve: reconciler: tmux snapshot failed, treating tracked spawn generations as pending this tick: %v", err)
+			snapshot = nil
+		} else {
+			snapshot = snap
+		}
+	}
+
 	var candidates []spawnCandidate
+	var kills []spawnKill
 	s.mu.Lock()
 	paused := s.state.SpawnPaused
+	kills = s.evaluateSpawnEvidenceLocked(snapshot, time.Now())
 	for _, pe := range autoSpawnProjects {
 		slug, cfg := pe.slug, pe.cfg
 		orchestratorName := "orchestrator-" + slug
@@ -145,7 +182,8 @@ func (s *Server) reconcileSpawnsOnce() {
 		// the cap can't diverge between the two paths again — that
 		// divergence (each independently counting only live agents) is
 		// exactly what let both decide to spawn ~11s apart and exceed
-		// max-orchestrators.
+		// max-orchestrators. Now also reflects phase 1's evidence pass
+		// (see effectiveAcceptingCountLocked's doc comment).
 		acceptingCount := s.effectiveAcceptingCountLocked(slug)
 
 		startable := startableCountBySlug[slug]
@@ -160,16 +198,40 @@ func (s *Server) reconcileSpawnsOnce() {
 		if !noAcceptingButRoutable && !scaleOutSaturated {
 			continue
 		}
-		candidates = append(candidates, spawnCandidate{slug: slug, cwd: cfg.Cwd})
-		// Record the intent at decision time, under the same lock — not
-		// paused: while paused nothing will actually spawn, and recording
-		// an intent anyway would waste spawnIntentTTL suppressing a real
-		// spawn once spawning resumes.
+
+		if s.state.SpawnFailures[slug] >= maxConsecutiveSpawnFailures {
+			s.logSpawnSuspendedLocked(slug, time.Now())
+			continue
+		}
+
+		agentName, tmuxSession := newGenerationIdentity(slug)
+		candidates = append(candidates, spawnCandidate{slug: slug, cwd: cfg.Cwd, agentName: agentName, tmuxSession: tmuxSession})
+		// Record the intent (and the tracked generation) at decision time,
+		// under the same lock — not while paused: while paused nothing
+		// will actually spawn, and recording anyway would waste
+		// spawnIntentTTL suppressing a real spawn once spawning resumes.
 		if !paused {
 			s.recordSpawnIntentLocked(slug)
+			s.recordSpawnedGenerationLocked(slug, agentName, tmuxSession, time.Now())
 		}
 	}
+	s.saveLocked()
 	s.mu.Unlock()
+
+	// Kills run outside the lock, same as spawns below.
+	killFn := s.spawnKillFunc
+	for _, k := range kills {
+		log.Printf("serve: reconciler: killing spawned session %s for %s (age %s): %s", k.Session, k.Slug, k.Age.Round(time.Second), k.Reason)
+		if killFn == nil {
+			continue // no kill func wired (test) — evidence/state already updated regardless
+		}
+		if err := killFn(k.Session); err != nil {
+			log.Printf("serve: reconciler: failed to kill session %s: %v", k.Session, err)
+		}
+	}
+	if len(kills) > 0 {
+		s.triggerRenders()
+	}
 
 	if len(candidates) == 0 {
 		return
@@ -180,7 +242,7 @@ func (s *Server) reconcileSpawnsOnce() {
 	}
 
 	for _, c := range candidates {
-		log.Printf("serve: reconciler spawning orchestrator for %s", c.slug)
-		s.spawnOrchestrator(c.slug, c.cwd)
+		log.Printf("serve: reconciler spawning orchestrator for %s (generation %s)", c.slug, c.tmuxSession)
+		s.spawnOrchestrator(c.slug, c.cwd, c.agentName, c.tmuxSession)
 	}
 }

@@ -582,6 +582,16 @@ func (s *Server) handleRepoSettings(w http.ResponseWriter, r *http.Request) {
 // spawn path skips actually spawning (see spawnOrchestrator's guard and
 // reconcileSpawnsOnce's batch check) — everything else (routing, drain,
 // retire, MR watcher, stuck-prompt dialogs/approval) keeps working.
+//
+// Un-pausing (paused:false) is ALSO the deliberate reset path for the
+// spawn-evidence failure cap (State.SpawnFailures, maxConsecutiveSpawnFailures
+// — see spawn_evidence.go): it clears every project's consecutive-failure
+// count. A daemon restart deliberately does NOT do this on its own — a
+// persisted suspension must stay suspended across a restart, same
+// tombstone-not-forget convention as the rest of State — but a human
+// explicitly resuming spawning (presumably after fixing whatever caused
+// the failures) is exactly the moment every project deserves a clean
+// slate again.
 func (s *Server) handleSpawnPause(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var req struct {
@@ -593,6 +603,11 @@ func (s *Server) handleSpawnPause(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		s.state.SpawnPaused = req.Paused
+		if !req.Paused {
+			for slug := range s.state.SpawnFailures {
+				delete(s.state.SpawnFailures, slug)
+			}
+		}
 		s.saveLocked()
 		s.mu.Unlock()
 		s.triggerRenders()

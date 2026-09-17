@@ -22,13 +22,13 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := ServeConfig{Port: 0, Projects: map[string]ProjectConfig{}}
-	srv := newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string) error { return nil })
+	srv := newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 	ts := httptest.NewServer(newMux(srv))
 	t.Cleanup(ts.Close)
 	return srv, ts
 }
 
-func newTestServerWithConfig(t *testing.T, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string) error) *httptest.Server {
+func newTestServerWithConfig(t *testing.T, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string, agentName, tmuxSession string) error) *httptest.Server {
 	t.Helper()
 	dir := t.TempDir()
 	srv := newServer(filepath.Join(dir, "state.json"), cfg, spawnFunc)
@@ -2115,7 +2115,7 @@ func TestRouteTaskNotification_SpawnsFreshGenerationWhenOnlyDrainingAlive(t *tes
 		Port:     0,
 		Projects: map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error {
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		callCount++
 		return nil
 	})
@@ -2156,7 +2156,7 @@ func TestOrchestratorStartupUsesInjectedSpawnFunc(t *testing.T) {
 			"proj-f": {AutoSpawn: true, Cwd: "/tmp/proj-f-repo"},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error {
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		callCount++
 		gotProject, gotCwd = project, cwd
 		return nil
@@ -2216,7 +2216,7 @@ func TestWebhookCaseInsensitiveProjectSpawn(t *testing.T) {
 			"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error {
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		gotProject, gotCwd = project, cwd
 		return nil
 	})
@@ -2265,7 +2265,7 @@ func TestWebhookClaudeProjectWikilinkNormalized(t *testing.T) {
 			"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"},
 		},
 	}
-	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string) error {
+	ts := newTestServerWithConfig(t, cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 		gotProject = project
 		return nil
 	})
@@ -2539,7 +2539,7 @@ func TestExitForSelfRestart_WaitsForInFlightMutation(t *testing.T) {
 // newReconcilerTestServer builds a Server with a temp-dir state file, an
 // injectable spawnFunc, and the given autoSpawn project config, without
 // starting any background goroutines.
-func newReconcilerTestServer(t *testing.T, projects map[string]ProjectConfig, spawnFunc func(project, cwd string, env map[string]string) error) *Server {
+func newReconcilerTestServer(t *testing.T, projects map[string]ProjectConfig, spawnFunc func(project, cwd string, env map[string]string, agentName, tmuxSession string) error) *Server {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := ServeConfig{Port: 0, Projects: projects}
@@ -2565,7 +2565,7 @@ func TestReconcileSpawnsOnce_SpawnsWhenQueuedAndNoAliveAgent(t *testing.T) {
 	var gotSlug, gotCwd string
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			gotSlug, gotCwd = project, cwd
 			return nil
@@ -2589,7 +2589,7 @@ func TestReconcileSpawnsOnce_SkipsWhenAliveAgentExists(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -2616,7 +2616,7 @@ func TestReconcileSpawnsOnce_SpawnsWhenOnlyDrainingAgentAlive(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -2642,7 +2642,7 @@ func TestReconcileSpawnsOnce_SkipsWhenNoQueuedMessages(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: true, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})
@@ -2661,7 +2661,7 @@ func TestReconcileSpawnsOnce_SkipsNonAutoSpawnProjects(t *testing.T) {
 	var callCount int
 	srv := newReconcilerTestServer(t,
 		map[string]ProjectConfig{"myapp": {AutoSpawn: false, Cwd: "/repos/myapp"}},
-		func(project, cwd string, env map[string]string) error {
+		func(project, cwd string, env map[string]string, agentName, tmuxSession string) error {
 			callCount++
 			return nil
 		})

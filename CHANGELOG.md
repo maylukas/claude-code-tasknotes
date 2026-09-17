@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 ### Fixed
 
 - MR watcher now polls every non-completed task with an `mr` field; a merged MR on a `needs-input` or `triage` task is noted on the task and shown as `mrState` in `/status.needsActionTasks` instead of being ignored (and is not auto-closed).
+- Spawn-loop guard: a spawned orchestrator that comes up (tmux session alive, claude process running) but never reaches `tn register` — e.g. blocked on a macOS Keychain unlock prompt — used to get silently respawned every ~3.5 minutes forever once the old fixed-clock spawn intent (`spawnIntentTTL` = 3min) expired, regardless of whether the earlier spawn was still alive. One incident produced 232 orchestrator tmux sessions for a single project overnight. Spawn decisions now track every outstanding generation with real evidence (`State.SpawnedGenerations`) instead of a clock: an entry stays counted as outstanding for as long as its tmux session is genuinely alive, is only resolved (killed, and counted as a failure if it never registered) once a tmux snapshot or a matching registration actually says so, and a project is suspended after 3 consecutive spawn failures (`POST /spawn/pause {"paused":false}` also clears the failure count, alongside its existing pause/resume role).
 
 ## [0.7.0] - 2026-09-08
 

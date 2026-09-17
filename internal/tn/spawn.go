@@ -169,6 +169,14 @@ func paneHasLiveClaude(panes []string) bool {
 // session out from under the user — so that case stays the original no-op.
 // A pane-list failure is treated the same conservative way: log and leave
 // the session alone rather than guess.
+//
+// This check is scoped to exactly ONE session name — the one THIS call was
+// given — never any other generation of the same project. It does not, by
+// itself, prevent multiple generations from piling up for one project; that
+// is what State.SpawnedGenerations/evaluateSpawnEvidenceLocked
+// (spawn_evidence.go) is for, tracking every outstanding spawn across
+// reconciler ticks rather than just the one this particular call happens to
+// be looking at.
 func spawnOrchestratorSession(project, cwd string, env map[string]string, agentName, tmuxSession string, agentAlive func() bool, hasSession tmuxHasSessionFunc, listPanes tmuxListPanesFunc, killSession tmuxKillSessionFunc, newSession tmuxNewSessionFunc, sendKeys sendKeysFunc, claudeBin, orchestratorDoc string) error {
 	session := tmuxSession
 
@@ -208,27 +216,38 @@ func spawnOrchestratorSession(project, cwd string, env map[string]string, agentN
 	return nil
 }
 
+// newGenerationIdentity computes a fresh generation's agent name and tmux
+// session for slug (SPEC-generations.md): agent name
+// orchestrator-<slug>-g<gen>, tmux session tn-<slug>-g<gen>, where gen :=
+// time.Now().Unix() mod 100000 — collision-safe enough day to day; the
+// ~27.7h wrap means an exact collision with a much older session name is
+// possible in principle, which is exactly what spawnOrchestratorSession's
+// stale-session check exists to resolve safely either way.
+//
+// Called once, at spawn-DECISION time (resolveTargetLocked,
+// reconcileSpawnsOnce) — NOT inside defaultSpawnFunc, which used to compute
+// this itself. Moved out so the identity can be recorded
+// (recordSpawnedGenerationLocked) under s.mu, before the actual spawn (slow,
+// unlocked) runs — see State.SpawnedGenerations' doc comment for why that
+// ordering matters.
+func newGenerationIdentity(slug string) (agentName, tmuxSession string) {
+	gen := time.Now().Unix() % 100000
+	return fmt.Sprintf("orchestrator-%s-g%d", slug, gen), fmt.Sprintf("tn-%s-g%d", slug, gen)
+}
+
 // defaultSpawnFunc starts a detached tmux session running the claude CLI
 // for a NEW generation of project's orchestrator — see
 // spawnOrchestratorSession for the stale-session-detection logic.
+// agentName/tmuxSession are the generation identity, already computed by
+// the caller (newGenerationIdentity, at decision time — see its doc
+// comment) and passed straight through.
 //
-// Generation naming (SPEC-generations.md): agent name
-// orchestrator-<project>-g<gen>, tmux session tn-<project>-g<gen>, where
-// gen := time.Now().Unix() mod 100000 — collision-safe enough day to day;
-// the ~27.7h wrap means an exact collision with a much older session name
-// is possible in principle, which is exactly what the stale-session check
-// above exists to resolve safely either way.
-//
-// sessionAlive is called with the computed tmux session name to get a
-// fresh alive check at spawn time (the caller that decided to spawn may
-// have done so from a snapshot that's since gone stale, e.g. a generation
-// registered a moment later).
-func defaultSpawnFunc(project, cwd string, env map[string]string, sessionAlive func(tmuxSession string) bool, orchestratorDoc string) error {
+// sessionAlive is called with tmuxSession to get a fresh alive check at
+// spawn time (the caller that decided to spawn may have done so from a
+// snapshot that's since gone stale, e.g. a generation registered a moment
+// later).
+func defaultSpawnFunc(project, cwd string, env map[string]string, agentName, tmuxSession string, sessionAlive func(tmuxSession string) bool, orchestratorDoc string) error {
 	tmux := resolveTmuxBin()
-
-	gen := time.Now().Unix() % 100000
-	agentName := fmt.Sprintf("orchestrator-%s-g%d", project, gen)
-	tmuxSession := fmt.Sprintf("tn-%s-g%d", project, gen)
 
 	hasSession := func(session string) bool {
 		return exec.Command(tmux, "has-session", "-t", session).Run() == nil

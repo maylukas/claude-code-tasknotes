@@ -93,6 +93,18 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// (e.g. scale-out) isn't stuck waiting on a stale intent.
 	s.clearSpawnIntentLocked(strings.ToLower(req.Project))
 
+	// Same idea for the evidence-based tracking (State.SpawnedGenerations/
+	// SpawnFailures, see spawn_evidence.go): a registration is the
+	// strongest possible proof that a specific tracked generation came up
+	// successfully, so remove THAT entry (matched by tmux session,
+	// falling back to agent name for an agent that registered without
+	// reporting one) and reset the project's consecutive-failure counter
+	// — matched by identity, not just by project, since with
+	// max-orchestrators > 1 more than one generation can be outstanding
+	// for the same slug at once and one registering must not be mistaken
+	// for all of them having registered.
+	s.clearSpawnedGenerationLocked(strings.ToLower(req.Project), req.TmuxSession, req.Name)
+
 	// The logical queue name orchestrator-<slug> is what gets used when
 	// nothing was alive to receive an assignment. Whichever concrete agent
 	// registers next for that project inherits anything still queued there

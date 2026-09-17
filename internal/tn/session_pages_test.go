@@ -225,7 +225,7 @@ func TestRenderSessionPagesWritesFiles(t *testing.T) {
 	dir := t.TempDir()
 	sessionPagesDir := dir + "/Claude Sessions"
 	cfg := ServeConfig{Port: 0, Projects: map[string]ProjectConfig{}, SessionPagesDir: sessionPagesDir}
-	srv := newServer(dir+"/state.json", cfg, func(project, cwd string, env map[string]string) error { return nil })
+	srv := newServer(dir+"/state.json", cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 
 	srv.mu.Lock()
 	srv.state.Agents["claude/foo-e2e"] = &Agent{

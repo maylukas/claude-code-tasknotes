@@ -163,6 +163,48 @@ file, missing keys, or junk/non-positive values (all fall back to defaults).
   higher cap racing TWO simultaneous decisions for the same slug within the TTL window could
   still slip a third spawn through. Accepted tradeoff, not fixed further (not something hit
   in practice, and the simple version is what's actually running).
+- **Spawn evidence tracking (daemon 0.10.1).** `spawnIntentTTL`'s fixed 3-minute clock bounded
+  only the short race between the two decision paths above — it did NOT bound a spawn that came
+  up (tmux session alive, claude process genuinely running) but never reached `tn register`
+  (observed cause: blocked on a macOS Keychain unlock prompt). Once that fixed clock expired,
+  the next reconciler tick saw zero accepting agents again and spawned ANOTHER generation,
+  invisible to every liveness check the same way — one incident produced 232 tmux sessions for
+  project "mizu" overnight, one every ~3–3.5min. Fixed by replacing the clock with real evidence:
+  `state.SpawnedGenerations map[string][]SpawnedGeneration` (slug → `{TmuxSession, AgentName,
+  SpawnedAt, Pending, LastCheckedAt}`) tracks every generation spawned but not yet resolved.
+  Both spawn paths compute the new generation's identity at DECISION time
+  (`newGenerationIdentity`, moved out of `defaultSpawnFunc`) and record it into
+  `SpawnedGenerations` under the same lock as the `PendingSpawns` intent, then pass that
+  identity into `spawnFunc` unchanged — so the tracked entry and the actual spawn always agree.
+  `effectiveAcceptingCountLocked` now counts `max(pendingFromIntent, pendingFromEntries)` rather
+  than summing them (both are recorded for the same spawn; summing would double-count it).
+  Each reconciler tick (`reconcileSpawnsOnce`), BEFORE taking `s.mu`, snapshots tmux once for
+  every tracked session (`spawnSnapshotFunc`, real impl `realSpawnSnapshot`: one `tmux ls` +
+  `list-panes` per tracked session that's alive) — tmux execs must never run under the lock.
+  Then, under the lock, `evaluateSpawnEvidenceLocked` resolves each entry:
+  - age < `spawnStartupGrace` (60s): always Pending, regardless of the snapshot (claude may not
+    have started yet).
+  - snapshot unavailable (nil `spawnSnapshotFunc`, or the snapshot call errored — matched
+    broadly for "no server running"/"no such file or directory"/"error connecting to", biased
+    toward treating an unrecognized wording as "zero sessions" rather than risking every tracked
+    entry going pending forever, a silent permanent respawn-block): always Pending, no kills.
+  - session missing, or alive with a claude process past `spawnRegisterDeadline` (10min), or
+    existing with no claude process past the grace: resolved as a FAILURE — entry dropped,
+    `SpawnFailures[slug]` incremented, `PendingSpawns[slug]` cleared (so the fixed-clock intent
+    can't itself keep blocking a respawn the evidence pass just confirmed is needed), and a
+    `spawnKill` queued for the caller to actually run (`spawnKillFunc`, real impl
+    `realKillSpawnedSession`) outside the lock.
+  - otherwise (alive, claude running, within the deadline): Pending.
+
+  At `maxConsecutiveSpawnFailures` (3) CONSECUTIVE failures for a slug, both spawn paths refuse
+  to spawn it at all and log `spawn SUSPENDED for <slug>: ...` at most once per hour per slug
+  (`logSpawnSuspendedLocked`). Reset paths: a registration matching a tracked entry's tmux
+  session (preferred) or agent name (`clearSpawnedGenerationLocked`, called from
+  `handleRegister` alongside the existing `clearSpawnIntentLocked`) resets that slug's
+  `SpawnFailures` to 0; a human un-pausing spawning (`POST /spawn/pause {"paused":false}`) also
+  clears EVERY slug's `SpawnFailures` — deliberately NOT reset by a daemon restart alone, since
+  `SpawnFailures`/`SpawnedGenerations` are persisted state and a restart silently forgiving a
+  genuinely broken project would defeat the cap's purpose.
 
 ## TaskNotes webhook handling
 

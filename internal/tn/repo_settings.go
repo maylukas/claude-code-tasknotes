@@ -180,8 +180,30 @@ type Server struct {
 	state     *State
 	statePath string
 	config    ServeConfig
-	spawnFunc func(project, cwd string, env map[string]string) error
-	notify    chan struct{} // closed and replaced on every new/updated message
+	spawnFunc func(project, cwd string, env map[string]string, agentName, tmuxSession string) error
+
+	// spawnSnapshotFunc/spawnKillFunc are what reconcileSpawnsOnce's
+	// evidence pass (evaluateSpawnEvidenceLocked, spawn_evidence.go) uses
+	// to inspect and tear down tracked tmux sessions. nil (the zero
+	// value, what newServer leaves them at) means "no snapshot function
+	// wired" — reconcileSpawnsOnce treats that the same as a snapshot
+	// error (every tracked entry stays Pending, nothing killed) rather
+	// than ever calling a nil func, so no test that doesn't explicitly
+	// set these fields can reach real tmux. cmdServe wires the real ones
+	// (realSpawnSnapshot, realKillSpawnedSession) after construction.
+	spawnSnapshotFunc spawnSnapshotFunc
+	spawnKillFunc     tmuxKillSessionFunc
+
+	// spawnSuspendLoggedAt/spawnLastFailedSession back
+	// logSpawnSuspendedLocked/countSpawnFailureLocked (spawn_evidence.go)
+	// — in-memory only, not persisted: a daemon restart re-logging the
+	// suspension once more, or briefly not knowing the last failed
+	// session's name, is harmless (arguably useful — confirms the
+	// suspension survived the restart). Guarded by mu, same as the other
+	// simple fields.
+	spawnSuspendLoggedAt   map[string]time.Time
+	spawnLastFailedSession map[string]string
+	notify                 chan struct{} // closed and replaced on every new/updated message
 
 	// startedAt is when this Server instance was constructed — the
 	// liveness-detection startup grace period (checkOrphanedDeathsOnce,
@@ -398,7 +420,7 @@ type Server struct {
 	orchestratorDoc string
 }
 
-func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string) error) *Server {
+func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd string, env map[string]string, agentName, tmuxSession string) error) *Server {
 	s := &Server{
 		state:                     loadState(statePath),
 		statePath:                 statePath,
@@ -417,6 +439,8 @@ func newServer(statePath string, cfg ServeConfig, spawnFunc func(project, cwd st
 		startedAt:                 time.Now(),
 		seenSinceStart:            map[string]bool{},
 		approveRescanDelay:        defaultApproveRescanDelay,
+		spawnSuspendLoggedAt:      map[string]time.Time{},
+		spawnLastFailedSession:    map[string]string{},
 	}
 	if s.dashboardPath != "" {
 		s.dashboardDeb = newDebouncer(dashboardDebounceInterval, s.renderDashboard)

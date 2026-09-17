@@ -16,7 +16,7 @@ func newJiraTestServer(t *testing.T, projects map[string]ProjectConfig) (*Server
 	t.Helper()
 	dir := t.TempDir()
 	cfg := ServeConfig{Port: 0, Projects: projects}
-	srv := newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string) error { return nil })
+	srv := newServer(filepath.Join(dir, "state.json"), cfg, func(project, cwd string, env map[string]string, agentName, tmuxSession string) error { return nil })
 	ts := httptest.NewServer(newMux(srv))
 	t.Cleanup(ts.Close)
 	return srv, ts

@@ -122,6 +122,8 @@ func loadState(path string) *State {
 		LastKnownStatus:     map[string]string{},
 		JiraRequests:        map[string]string{},
 		PendingSpawns:       map[string]time.Time{},
+		SpawnedGenerations:  map[string][]SpawnedGeneration{},
+		SpawnFailures:       map[string]int{},
 		CreatedTasks:        map[string]createdTaskRecord{},
 		Workers:             map[string][]workerEntry{},
 		DoneMeansNoted:      map[string]bool{},
@@ -183,6 +185,12 @@ func loadState(path string) *State {
 	}
 	if st.MRCursors == nil {
 		st.MRCursors = map[string]time.Time{}
+	}
+	if st.SpawnedGenerations == nil {
+		st.SpawnedGenerations = map[string][]SpawnedGeneration{}
+	}
+	if st.SpawnFailures == nil {
+		st.SpawnFailures = map[string]int{}
 	}
 	return st
 }
@@ -447,24 +455,52 @@ func (s *Server) queueMessageLocked(to string, req sendRequest) *Message {
 // counts as "an accepting agent is on the way" for cap-enforcement
 // purposes. Must cover real spawn latency (tmux + claude startup +
 // registration — observed several seconds to low tens of seconds in
-// practice) but stay short enough that a spawn which silently failed
-// (spawnFunc error, crashed session) doesn't wedge a project out of ever
-// spawning again; the periodic reconciler re-checks every 30s regardless,
-// so a few minutes of dead air is the actual cost of expiry being wrong.
+// practice) but stay short enough to close the narrow race between the two
+// independent decision paths (see effectiveAcceptingCountLocked's doc
+// comment) without itself becoming a source of stale state.
+//
+// This TTL is NOT what makes an alive-but-never-registering spawn safe —
+// that used to be its only job, and that was the actual bug: a spawn that
+// came up (tmux session alive, claude process running) but never reached
+// `tn register` (observed cause: blocked on a macOS keychain unlock
+// prompt) was invisible to every liveness check, so once this fixed clock
+// ran out, the next reconciler tick saw zero accepting agents again and
+// spawned ANOTHER one — 232 of them overnight, one every ~3-3.5min, for
+// project "mizu". Evidence-based tracking (State.SpawnedGenerations,
+// evaluateSpawnEvidenceLocked in spawn_evidence.go) now bounds that
+// failure mode instead: a tracked generation keeps counting as
+// outstanding for as long as its tmux session is genuinely alive with a
+// claude process in it, however long that takes, and only gets resolved
+// (and, if it never registered, counted as a failure toward
+// maxConsecutiveSpawnFailures) once there's actual evidence one way or
+// the other. PendingSpawns/spawnIntentTTL still exist purely for the
+// original short-race-window purpose.
 const spawnIntentTTL = 3 * time.Minute
 
 // effectiveAcceptingCountLocked returns project's accepting-agent count
-// for cap-enforcement purposes: live accepting agents PLUS a recent,
-// still-unfulfilled spawn intent for the same slug (see PendingSpawns) —
-// counted as one more, since it represents an agent that will register
-// shortly. Both spawn paths (resolveTargetLocked's on-demand spawn and
+// for cap-enforcement purposes: live accepting agents PLUS whichever is
+// LARGER of (a) a recent, still-unfulfilled spawn intent for the same slug
+// (PendingSpawns, spawnIntentTTL) or (b) the number of SpawnedGenerations
+// entries for the slug currently marked Pending (see
+// evaluateSpawnEvidenceLocked). Deliberately max, not sum: both (a) and
+// (b) are recorded together, under the same lock, at the exact same
+// spawn-decision point (see recordSpawnIntentLocked/
+// recordSpawnedGenerationLocked's call sites) — summing them would count
+// one real outstanding spawn as two. (a) only ever represents "at most 1"
+// (PendingSpawns is a single timestamp per slug, not a counter) and decays
+// on a fixed clock; (b) can represent several concurrent outstanding
+// spawns (relevant once max-orchestrators > 1) and decays only on actual
+// evidence, so once (a) has expired or been cleared, (b) is what
+// continues to hold the line.
+//
+// Both spawn paths (resolveTargetLocked's on-demand spawn and
 // reconcileSpawnsOnce's periodic pass) MUST call this same helper rather
 // than counting live agents themselves: the original bug was exactly that
 // divergence — each path independently saw zero live accepting agents (the
 // three prior generations were all draining) and both decided to spawn,
 // ~11s apart, before either new agent had finished registering. An expired
-// intent is lazily cleaned up here rather than needing a separate sweep.
-// Must be called with s.mu held.
+// PendingSpawns intent is lazily cleaned up here rather than needing a
+// separate sweep. Must be called with s.mu held.
 func (s *Server) effectiveAcceptingCountLocked(slug string) int {
 	count := 0
 	for _, a := range s.state.Agents {
@@ -472,12 +508,24 @@ func (s *Server) effectiveAcceptingCountLocked(slug string) int {
 			count++
 		}
 	}
+	pendingFromIntent := 0
 	if at, ok := s.state.PendingSpawns[slug]; ok {
 		if time.Since(at) < spawnIntentTTL {
-			count++
+			pendingFromIntent = 1
 		} else {
 			delete(s.state.PendingSpawns, slug)
 		}
+	}
+	pendingFromGenerations := 0
+	for _, g := range s.state.SpawnedGenerations[slug] {
+		if g.Pending {
+			pendingFromGenerations++
+		}
+	}
+	if pendingFromGenerations > pendingFromIntent {
+		count += pendingFromGenerations
+	} else {
+		count += pendingFromIntent
 	}
 	return count
 }
@@ -493,6 +541,59 @@ func (s *Server) recordSpawnIntentLocked(slug string) {
 		s.state.PendingSpawns = map[string]time.Time{}
 	}
 	s.state.PendingSpawns[slug] = time.Now()
+}
+
+// recordSpawnedGenerationLocked adds a new tracked, Pending SpawnedGeneration
+// entry for slug — called at the same DECISION point as
+// recordSpawnIntentLocked (both spawn paths), with the identity
+// (agentName, tmuxSession) already computed by newGenerationIdentity so it
+// can be recorded here, under s.mu, BEFORE the slow actual spawn runs (see
+// State.SpawnedGenerations' doc comment). Must be called with s.mu held.
+func (s *Server) recordSpawnedGenerationLocked(slug, agentName, tmuxSession string, at time.Time) {
+	if s.state.SpawnedGenerations == nil {
+		s.state.SpawnedGenerations = map[string][]SpawnedGeneration{}
+	}
+	s.state.SpawnedGenerations[slug] = append(s.state.SpawnedGenerations[slug], SpawnedGeneration{
+		TmuxSession:   tmuxSession,
+		AgentName:     agentName,
+		SpawnedAt:     at,
+		Pending:       true,
+		LastCheckedAt: at,
+	})
+}
+
+// clearSpawnedGenerationLocked removes the ONE tracked SpawnedGenerations
+// entry for slug matching tmuxSession (preferred) or agentName (fallback,
+// for an agent that registered without reporting a tmux session), and
+// resets SpawnFailures[slug] to 0 — a successful registration is exactly
+// the positive evidence SpawnFailures exists to be corrected by. Matches
+// by identity, not just by project, deliberately: with max-orchestrators
+// > 1 more than one generation can be outstanding for the same slug at
+// once, and one of them registering must not be mistaken for ALL of them
+// having registered. No-op if nothing matches (also fine — e.g. an agent
+// that registered without ever going through a tracked spawn decision, a
+// pre-existing test helper, or a slug with no tracked entries at all).
+// Must be called with s.mu held.
+func (s *Server) clearSpawnedGenerationLocked(slug, tmuxSession, agentName string) {
+	entries := s.state.SpawnedGenerations[slug]
+	idx := -1
+	for i, g := range entries {
+		if (tmuxSession != "" && g.TmuxSession == tmuxSession) || (agentName != "" && g.AgentName == agentName) {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return
+	}
+	s.state.SpawnedGenerations[slug] = append(entries[:idx], entries[idx+1:]...)
+	if len(s.state.SpawnedGenerations[slug]) == 0 {
+		delete(s.state.SpawnedGenerations, slug)
+	}
+	if s.state.SpawnFailures == nil {
+		s.state.SpawnFailures = map[string]int{}
+	}
+	s.state.SpawnFailures[slug] = 0
 }
 
 // clearSpawnIntentLocked drops slug's spawn intent — called the moment an
@@ -532,24 +633,30 @@ func (s *Server) clearSpawnIntentLocked(slug string) {
 // draining owner (alive, but not accepting new work) left a real Jira
 // request sitting unacked indefinitely during the !1067 live test. Must
 // be called with s.mu held.
-func (s *Server) resolveTargetLocked(to, project, taskPath string, useOwnerRouting bool) (target string, needSpawn bool, cwd string, status int, extra map[string]any) {
+//
+// agentName/tmuxSession are the freshly-computed identity for the new
+// generation when needSpawn is true (empty otherwise) — the caller
+// (dispatchMessage) must pass both through to spawnOrchestrator unchanged,
+// since they were already recorded into State.SpawnedGenerations here,
+// under the same lock, before the actual (slow, unlocked) spawn runs.
+func (s *Server) resolveTargetLocked(to, project, taskPath string, useOwnerRouting bool) (target string, needSpawn bool, cwd, agentName, tmuxSession string, status int, extra map[string]any) {
 	extra = map[string]any{}
 	status = http.StatusOK
 
 	if to != "" {
-		return to, false, "", status, extra
+		return to, false, "", "", "", status, extra
 	}
 
 	if useOwnerRouting && taskPath != "" {
 		if owner := s.taskOwnerLocked(taskPath); owner != "" {
 			if a, ok := s.state.Agents[owner]; ok && isAlive(a) {
-				return owner, false, "", status, extra
+				return owner, false, "", "", "", status, extra
 			}
 		}
 	}
 
 	if a := s.pickAcceptingAgentForAssignmentLocked(project); a != nil {
-		return a.Name, false, "", status, extra
+		return a.Name, false, "", "", "", status, extra
 	}
 
 	slug := strings.ToLower(project)
@@ -561,7 +668,7 @@ func (s *Server) resolveTargetLocked(to, project, taskPath string, useOwnerRouti
 		// rather than composing a bare "orchestrator-" that matches no
 		// register call and would strand it permanently (see
 		// orchestratorQueueName's doc comment for the live incident).
-		return "", false, "", http.StatusBadRequest, map[string]any{
+		return "", false, "", "", "", http.StatusBadRequest, map[string]any{
 			"error": "cannot route message: no recipient, no task owner, and no project to route by",
 		}
 	}
@@ -577,14 +684,26 @@ func (s *Server) resolveTargetLocked(to, project, taskPath string, useOwnerRouti
 		// message arriving in the seconds after the reconciler already
 		// decided to spawn would decide to spawn again too.
 		if s.effectiveAcceptingCountLocked(slug) == 0 {
-			needSpawn = true
-			cwd = cfg.Cwd
-			s.recordSpawnIntentLocked(slug)
+			if s.state.SpawnFailures[slug] >= maxConsecutiveSpawnFailures {
+				// Same cap the reconciler enforces (see
+				// maxConsecutiveSpawnFailures) — this path must refuse
+				// too, or a message arriving on-demand would keep
+				// respawning a slug the reconciler has already given up
+				// on.
+				s.logSpawnSuspendedLocked(slug, time.Now())
+				extra["warning"] = "spawn suspended: repeated orchestrators never registered"
+			} else {
+				needSpawn = true
+				cwd = cfg.Cwd
+				agentName, tmuxSession = newGenerationIdentity(slug)
+				s.recordSpawnIntentLocked(slug)
+				s.recordSpawnedGenerationLocked(slug, agentName, tmuxSession, time.Now())
+			}
 		}
 	} else {
 		extra["warning"] = "no live agent"
 	}
-	return target, needSpawn, cwd, status, extra
+	return target, needSpawn, cwd, agentName, tmuxSession, status, extra
 }
 
 // projectConfigFor returns the ProjectConfig for slug, matching
@@ -647,8 +766,12 @@ func (s *Server) sessionAlive(tmuxSession string) bool {
 }
 
 // spawnOrchestrator resolves a cwd default and calls the injected spawnFunc.
-// Never called with s.mu held.
-func (s *Server) spawnOrchestrator(project, cwd string) {
+// agentName/tmuxSession are the generation identity already computed AND
+// recorded into State.SpawnedGenerations by the caller (resolveTargetLocked
+// or reconcileSpawnsOnce) at decision time — spawnOrchestrator itself never
+// computes an identity, only uses the one it's given, so the tracked entry
+// and the actual spawn always agree. Never called with s.mu held.
+func (s *Server) spawnOrchestrator(project, cwd, agentName, tmuxSession string) {
 	s.mu.Lock()
 	paused := s.state.SpawnPaused
 	env := injectedEnv(s.projectConfigFor(project))
@@ -670,9 +793,26 @@ func (s *Server) spawnOrchestrator(project, cwd string) {
 		env["TN_MAX_WORKERS"] = strconv.Itoa(mw)
 	}
 
-	log.Printf("serve: starting orchestrator for project %s (cwd=%s)", project, cwd)
-	if err := s.spawnFunc(project, cwd, env); err != nil {
-		log.Printf("serve: failed to start orchestrator for project %s: %v", project, err)
+	log.Printf("serve: starting orchestrator for project %s (cwd=%s, generation=%s)", project, cwd, tmuxSession)
+	if err := s.spawnFunc(project, cwd, env, agentName, tmuxSession); err != nil {
+		log.Printf("serve: failed to start orchestrator for project %s (generation %s): %v", project, tmuxSession, err)
+		// The spawn never happened (or happened but errored before we can
+		// trust it), so the tracked SpawnedGenerations entry recorded at
+		// decision time is now known-wrong — drop it and count the
+		// failure immediately rather than waiting for the reconciler's
+		// next evidence tick to (eventually) reach the same conclusion
+		// from a tmux snapshot that will just show the session was never
+		// created. Also clears any still-fresh PendingSpawns entry for
+		// the slug — see effectiveAcceptingCountLocked's doc comment on
+		// why leaving it would block a legitimate retry for up to
+		// spawnIntentTTL despite the failure already being confirmed.
+		slug := strings.ToLower(project)
+		s.mu.Lock()
+		s.recordSpawnFailureLocked(slug, tmuxSession)
+		s.clearSpawnIntentLocked(slug)
+		s.saveLocked()
+		s.mu.Unlock()
+		s.triggerRenders()
 	}
 }
 
@@ -689,7 +829,7 @@ func (s *Server) spawnOrchestrator(project, cwd string) {
 // gives the caller an independent copy immune to later mutation.
 func (s *Server) dispatchMessage(req sendRequest) (Message, int, map[string]any) {
 	s.mu.Lock()
-	to, needSpawn, cwd, status, extra := s.resolveTargetLocked(req.To, req.Project, req.TaskPath, !req.SkipOwnerRouting)
+	to, needSpawn, cwd, agentName, tmuxSession, status, extra := s.resolveTargetLocked(req.To, req.Project, req.TaskPath, !req.SkipOwnerRouting)
 	s.mu.Unlock()
 
 	// resolveTargetLocked returns to=="" ONLY on the "nowhere to route
@@ -715,7 +855,7 @@ func (s *Server) dispatchMessage(req sendRequest) (Message, int, map[string]any)
 		// orchestrator/tmux session, so a mixed-case caller still gets a
 		// consistent spawn (webhook-derived project is already lowercase
 		// via normalizeProjectSlug; this covers direct callers too).
-		s.spawnOrchestrator(strings.ToLower(req.Project), cwd)
+		s.spawnOrchestrator(strings.ToLower(req.Project), cwd, agentName, tmuxSession)
 	}
 
 	s.mu.Lock()
