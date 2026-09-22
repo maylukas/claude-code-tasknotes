@@ -1,6 +1,7 @@
 package tn
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -59,6 +60,55 @@ func resolveOrchestratorDoc(cfg ServeConfig) (path string, found bool) {
 		}
 	}
 	return fallback, false
+}
+
+// ensureManagedOrchestratorDoc writes the embedded ORCHESTRATOR.md to its
+// managed location, ~/.config/tn/ORCHESTRATOR.md (candidate 3 in
+// resolveOrchestratorDoc's order), so a `tn` binary installed without a
+// checkout still hands spawned sessions a contract. The managed file is
+// generated: it is written when absent and rewritten whenever its content
+// differs from what this binary embeds (a copy left by an older build, or
+// hand edits). To customise the contract, point TN_ORCHESTRATOR_DOC or
+// serve.json's "orchestratorDoc" at your own file; an override that names
+// the managed path itself claims that file as the user's copy, and the sync
+// leaves it alone.
+//
+// Returns the managed path, whether a write happened, and any error from
+// resolving the home directory or writing the file. Writes go through
+// atomicWriteFile like every other file the daemon owns.
+func ensureManagedOrchestratorDoc(cfg ServeConfig, embedded []byte) (path string, written bool, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false, err
+	}
+	path = filepath.Join(home, ".config", "tn", "ORCHESTRATOR.md")
+	for _, override := range []string{os.Getenv("TN_ORCHESTRATOR_DOC"), cfg.OrchestratorDoc} {
+		if override != "" && samePath(override, path) {
+			return path, false, nil
+		}
+	}
+	if existing, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(existing, embedded) {
+		return path, false, nil
+	}
+	if err := atomicWriteFile(path, embedded); err != nil {
+		return path, false, err
+	}
+	return path, true, nil
+}
+
+// samePath reports whether a and b name the same file after cleaning and
+// making both absolute (symlinks are resolved when possible, best-effort).
+func samePath(a, b string) bool {
+	norm := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			p = real
+		}
+		return filepath.Clean(p)
+	}
+	return norm(a) == norm(b)
 }
 
 // buildOrchestratorPrompt returns the bootstrap prompt sent to a

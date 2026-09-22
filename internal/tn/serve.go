@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	tasknotescli "tasknotes-cli"
 )
 
 // daemonStartedAt is when this process started, used to compute /status
@@ -24,7 +26,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.10.1"
+const daemonVersion = "0.10.2"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -656,6 +658,11 @@ func cmdServe(args []string) error {
 	}
 
 	cfg := resolveServeConfig(*port)
+	if managed, written, err := ensureManagedOrchestratorDoc(cfg, tasknotescli.OrchestratorDoc); err != nil {
+		log.Printf("serve: could not write embedded ORCHESTRATOR.md to %s: %v", managed, err)
+	} else if written {
+		log.Printf("serve: wrote embedded ORCHESTRATOR.md to %s (managed copy, overwritten when it drifts from the binary; customise via TN_ORCHESTRATOR_DOC or serve.json orchestratorDoc)", managed)
+	}
 	orchestratorDoc, orchestratorDocFound := resolveOrchestratorDoc(cfg)
 	if !orchestratorDocFound {
 		log.Printf("serve: ORCHESTRATOR.md not found (set TN_ORCHESTRATOR_DOC or serve.json orchestratorDoc); spawned orchestrators will get a prompt without the contract path")
