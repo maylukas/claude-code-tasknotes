@@ -12,6 +12,15 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 
 ### Added
 
+- `ORCHESTRATOR.md` is embedded in the `tn` binary (root `embed.go`) and synced
+  to `~/.config/tn/ORCHESTRATOR.md` at `tn serve` startup, so a binary installed
+  without a checkout still hands spawned orchestrators their contract. The file
+  is yours to edit, with conffile semantics: a header line records the sha256 of
+  the contract it was written from; an untouched copy is refreshed when a newer
+  binary changes the contract, an edited copy is kept and the newer contract is
+  written to `ORCHESTRATOR.md.new` beside it for you to merge. `TN_ORCHESTRATOR_DOC`
+  / `orchestratorDoc` point spawns at a contract kept elsewhere. `daemonVersion`
+  0.10.3.
 - MR watcher now also tracks GitLab review-comment threads on an open MR: a new reviewer comment (never the acting agent's own) appends a note to the task and messages its owner, and `/status.needsActionTasks[].mrOpenThreads` (also surfaced on an agent's `ownedTasks`) reports the unresolved-thread count. `TN_NO_MRCOMMENTS=1` disables just this sub-pass.
 - GitHub pull requests are supported by the MR watcher next to GitLab merge requests; provider is detected from the URL or set per project with `codeHost`.
 

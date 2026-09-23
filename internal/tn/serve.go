@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	tasknotescli "tasknotes-cli"
 )
 
 // daemonStartedAt is when this process started, used to compute /status
@@ -24,7 +26,7 @@ var daemonStartedAt = time.Now()
 
 // daemonVersion is the tray-app-facing daemon version, surfaced via
 // /status and /health. Bump on notable changes (see CLAUDE.md).
-const daemonVersion = "0.10.1"
+const daemonVersion = "0.10.3"
 
 // aliveWindow is how recently an agent must have polled its inbox (or
 // registered) to be considered alive.
@@ -656,6 +658,16 @@ func cmdServe(args []string) error {
 	}
 
 	cfg := resolveServeConfig(*port)
+	switch managed, action, err := ensureManagedOrchestratorDoc(tasknotescli.OrchestratorDoc); {
+	case err != nil:
+		log.Printf("serve: could not sync embedded ORCHESTRATOR.md to %s: %v", managed, err)
+	case action == managedDocWritten:
+		log.Printf("serve: wrote embedded ORCHESTRATOR.md to %s (managed copy; edits there are kept, a newer contract lands in %s%s)", managed, managed, managedDocNewSuffix)
+	case action == managedDocKept:
+		log.Printf("serve: %s has local edits on the current contract; kept", managed)
+	case action == managedDocKeptNewer:
+		log.Printf("serve: %s has local edits; kept, this binary's newer contract is at %s%s for you to merge", managed, managed, managedDocNewSuffix)
+	}
 	orchestratorDoc, orchestratorDocFound := resolveOrchestratorDoc(cfg)
 	if !orchestratorDocFound {
 		log.Printf("serve: ORCHESTRATOR.md not found (set TN_ORCHESTRATOR_DOC or serve.json orchestratorDoc); spawned orchestrators will get a prompt without the contract path")

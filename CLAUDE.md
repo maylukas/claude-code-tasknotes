@@ -71,6 +71,7 @@ cd .. && go build -o ~/bin/tn ./cmd/tn   # picks up whatever is currently in web
 | File | Contents |
 |---|---|
 | `cmd/tn/main.go` | Entrypoint (package `main`): calls `tn.Run` |
+| `embed.go` | Module root (package `tasknotescli`): `//go:embed ORCHESTRATOR.md` as `OrchestratorDoc`; `tn serve` writes it to `~/.config/tn/ORCHESTRATOR.md` at startup (`ensureManagedOrchestratorDoc`, spawn.go) — the file must stay at the repo root because `go:embed` can't reach a parent dir |
 | `internal/tn/api.go` | TaskNotes API client (config resolve, task CRUD, query, webhooks list/create) |
 | `internal/tn/main.go` | CLI dispatch + usage text (package `tn`) |
 | `internal/tn/serve.go` | Daemon state model, `Server` type, config resolution, entrypoint (`newMux`, `cmdServe`) |
