@@ -62,53 +62,168 @@ func resolveOrchestratorDoc(cfg ServeConfig) (path string, found bool) {
 	return fallback, false
 }
 
-// ensureManagedOrchestratorDoc writes the embedded ORCHESTRATOR.md to its
-// managed location, ~/.config/tn/ORCHESTRATOR.md (candidate 3 in
-// resolveOrchestratorDoc's order), so a `tn` binary installed without a
-// checkout still hands spawned sessions a contract. The managed file is
-// generated: it is written when absent and rewritten whenever its content
-// differs from what this binary embeds (a copy left by an older build, or
-// hand edits). To customise the contract, point TN_ORCHESTRATOR_DOC or
-// serve.json's "orchestratorDoc" at your own file; an override that names
-// the managed path itself claims that file as the user's copy, and the sync
-// leaves it alone.
-//
-// Returns the managed path, whether a write happened, and any error from
-// resolving the home directory or writing the file. Writes go through
-// atomicWriteFile like every other file the daemon owns.
-func ensureManagedOrchestratorDoc(cfg ServeConfig, embedded []byte) (path string, written bool, err error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", false, err
-	}
-	path = filepath.Join(home, ".config", "tn", "ORCHESTRATOR.md")
-	for _, override := range []string{os.Getenv("TN_ORCHESTRATOR_DOC"), cfg.OrchestratorDoc} {
-		if override != "" && samePath(override, path) {
-			return path, false, nil
-		}
-	}
-	if existing, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(existing, embedded) {
-		return path, false, nil
-	}
-	if err := atomicWriteFile(path, embedded); err != nil {
-		return path, false, err
-	}
-	return path, true, nil
+// managedDocHeaderPrefix opens the one-line HTML comment the daemon puts at
+// the top of the managed ORCHESTRATOR.md. Markdown renders nothing for it,
+// so the contract a spawned session reads is unaffected, and it doubles as
+// the notice a human sees on opening the file. The hex after the prefix is
+// the sha256 of the embedded contract the copy was written from ("base");
+// a body whose sha256 still equals it has never been edited.
+const managedDocHeaderPrefix = "<!-- tn: managed copy of ORCHESTRATOR.md, base-sha256="
+
+// managedDocHeaderSuffix closes the header line and tells the reader what
+// the daemon will and will not do to the file.
+const managedDocHeaderSuffix = ". You may edit this file: tn serve keeps a changed file and writes a newer contract to ORCHESTRATOR.md.new beside it instead of overwriting. -->\n"
+
+// managedDocNewSuffix is appended to the managed path for the copy the
+// daemon drops beside a user-edited file when the embedded contract has
+// moved on (conffile semantics, like dpkg's .dpkg-dist).
+const managedDocNewSuffix = ".new"
+
+// managedDocAction is what ensureManagedOrchestratorDoc did on one run.
+type managedDocAction int
+
+const (
+	// managedDocUpToDate: the file is pristine and already matches this
+	// binary's contract; nothing written.
+	managedDocUpToDate managedDocAction = iota
+	// managedDocWritten: the managed file was (re)written from the embed —
+	// it was absent, or pristine but from an older contract.
+	managedDocWritten
+	// managedDocKept: the file has local edits and the embedded contract
+	// is the same one those edits were made on; kept, nothing to merge.
+	managedDocKept
+	// managedDocKeptNewer: the file has local edits and this binary's
+	// contract differs from the one they were based on; the file was kept
+	// and the current contract written to <path>.new for the user to merge.
+	managedDocKeptNewer
+)
+
+// renderManagedDoc returns header + embedded: what a pristine managed copy
+// of this binary's contract looks like on disk.
+func renderManagedDoc(embedded []byte) []byte {
+	out := make([]byte, 0, len(managedDocHeaderPrefix)+64+len(managedDocHeaderSuffix)+len(embedded))
+	out = append(out, managedDocHeaderPrefix...)
+	out = append(out, sha256Hex(string(embedded))...)
+	out = append(out, managedDocHeaderSuffix...)
+	return append(out, embedded...)
 }
 
-// samePath reports whether a and b name the same file after cleaning and
-// making both absolute (symlinks are resolved when possible, best-effort).
-func samePath(a, b string) bool {
-	norm := func(p string) string {
-		if abs, err := filepath.Abs(p); err == nil {
-			p = abs
-		}
-		if real, err := filepath.EvalSymlinks(p); err == nil {
-			p = real
-		}
-		return filepath.Clean(p)
+// parseManagedDoc splits a managed copy into the base hash recorded in its
+// header and the body below it. ok is false when the first line is not a
+// header this daemon wrote (a hand-made file, or a copy from the earlier
+// build that wrote the raw embed without one); body is then the whole
+// content.
+func parseManagedDoc(content []byte) (base string, body []byte, ok bool) {
+	if !bytes.HasPrefix(content, []byte(managedDocHeaderPrefix)) {
+		return "", content, false
 	}
-	return norm(a) == norm(b)
+	rest := content[len(managedDocHeaderPrefix):]
+	if len(rest) < 64 || !isHex(rest[:64]) {
+		return "", content, false
+	}
+	// The wording after the hash may change between builds; only the
+	// prefix, the hash, and a comment closing the same line are load-bearing.
+	nl := bytes.IndexByte(rest, '\n')
+	if nl < 64 || !bytes.HasSuffix(bytes.TrimRight(rest[64:nl], " \t"), []byte("-->")) {
+		return "", content, false
+	}
+	return string(rest[:64]), rest[nl+1:], true
+}
+
+func isHex(b []byte) bool {
+	for _, c := range b {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureManagedOrchestratorDoc syncs the embedded ORCHESTRATOR.md to its
+// managed location, ~/.config/tn/ORCHESTRATOR.md (candidate 3 in
+// resolveOrchestratorDoc's order), so a `tn` binary installed without a
+// checkout still hands spawned sessions a contract. The file is the user's
+// to edit; the sync follows conffile semantics:
+//
+//   - absent, or pristine (body sha256 equals the header's base) but from
+//     an older contract: written from the embed (managedDocWritten);
+//   - pristine and current: untouched (managedDocUpToDate);
+//   - edited, and the embed is still the contract the edits were based on:
+//     untouched (managedDocKept);
+//   - edited, and the embed has moved on: untouched, and the current
+//     contract is written to <path>.new for the user to merge, unless an
+//     identical .new is already there (managedDocKeptNewer either way).
+//
+// A file with no header (hand-made, or written by the earlier build that
+// stored the raw embed) counts as pristine only if it equals the embed
+// byte for byte; anything else is treated as edited with an unknown base,
+// so it is kept and a .new is written — the safe direction. Any .new left
+// beside a pristine file is stale and removed.
+//
+// TN_ORCHESTRATOR_DOC and serve.json's "orchestratorDoc" still redirect
+// spawns to a file elsewhere; they do not affect this sync.
+//
+// Returns the managed path, what happened, and any error from resolving
+// the home directory or writing. Writes go through atomicWriteFile like
+// every other file the daemon owns.
+func ensureManagedOrchestratorDoc(embedded []byte) (path string, action managedDocAction, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", managedDocUpToDate, err
+	}
+	path = filepath.Join(home, ".config", "tn", "ORCHESTRATOR.md")
+	newPath := path + managedDocNewSuffix
+	rendered := renderManagedDoc(embedded)
+	embedHash := sha256Hex(string(embedded))
+
+	existing, readErr := os.ReadFile(path)
+	if readErr != nil {
+		if !os.IsNotExist(readErr) {
+			return path, managedDocUpToDate, readErr
+		}
+		if err := atomicWriteFile(path, rendered); err != nil {
+			return path, managedDocUpToDate, err
+		}
+		removeIfExists(newPath)
+		return path, managedDocWritten, nil
+	}
+	if bytes.Equal(existing, rendered) {
+		removeIfExists(newPath)
+		return path, managedDocUpToDate, nil
+	}
+
+	base, body, hasHeader := parseManagedDoc(existing)
+	bodyHash := sha256Hex(string(body))
+	pristine := hasHeader && bodyHash == base
+	if !hasHeader && bodyHash == embedHash {
+		pristine = true // earlier build's headerless copy of this same contract
+	}
+	if pristine {
+		if err := atomicWriteFile(path, rendered); err != nil {
+			return path, managedDocUpToDate, err
+		}
+		removeIfExists(newPath)
+		return path, managedDocWritten, nil
+	}
+
+	// Edited by the user. Only offer a .new when the contract has actually
+	// moved on from what the edits were based on.
+	if hasHeader && base == embedHash {
+		return path, managedDocKept, nil
+	}
+	if current, err := os.ReadFile(newPath); err == nil && bytes.Equal(current, rendered) {
+		return path, managedDocKeptNewer, nil
+	}
+	if err := atomicWriteFile(newPath, rendered); err != nil {
+		return path, managedDocKeptNewer, err
+	}
+	return path, managedDocKeptNewer, nil
+}
+
+func removeIfExists(path string) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("serve: could not remove stale %s: %v", path, err)
+	}
 }
 
 // buildOrchestratorPrompt returns the bootstrap prompt sent to a

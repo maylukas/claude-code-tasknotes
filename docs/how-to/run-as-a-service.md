@@ -10,7 +10,7 @@ Keep the bridge daemon running continuously instead of in a foreground terminal.
 - `tn` built and working (`tn health` succeeds).
 - `~/.config/tn/config.json` and `~/.config/tn/serve.json` already set up.
 
-The daemon hands every spawned orchestrator session `ORCHESTRATOR.md`, its operating contract. The binary embeds it and writes it to `~/.config/tn/ORCHESTRATOR.md` at startup, so nothing needs copying; that file is managed and gets rewritten whenever it differs from the running binary's copy. To run a customised contract, set `"orchestratorDoc": "/path/to/your/ORCHESTRATOR.md"` in `serve.json` (or `TN_ORCHESTRATOR_DOC`). The startup log prints `serve: orchestrator contract: <path>`; see [the configuration reference](../reference/configuration.md#files-and-directories).
+The daemon hands every spawned orchestrator session `ORCHESTRATOR.md`, its operating contract. The binary embeds it and writes it to `~/.config/tn/ORCHESTRATOR.md` at startup, so nothing needs copying. Edit that file freely: the daemon refreshes it only while it is untouched, and once you have changed it a newer contract in a later binary is written to `~/.config/tn/ORCHESTRATOR.md.new` beside it for you to merge (the startup log says so). To keep the contract somewhere else entirely, set `"orchestratorDoc": "/path/to/your/ORCHESTRATOR.md"` in `serve.json` (or `TN_ORCHESTRATOR_DOC`). The startup log prints `serve: orchestrator contract: <path>`; see [the configuration reference](../reference/configuration.md#files-and-directories).
 
 ## 1. Write a LaunchAgent plist
 

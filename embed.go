@@ -7,9 +7,11 @@
 // parent directory, so the embed lives here rather than in internal/tn.
 //
 // `tn serve` writes this copy to ~/.config/tn/ORCHESTRATOR.md at startup
-// (see ensureManagedOrchestratorDoc in internal/tn/spawn.go); that managed
-// file is generated, and the TN_ORCHESTRATOR_DOC / serve.json
-// "orchestratorDoc" overrides are the way to run a customised contract.
+// (see ensureManagedOrchestratorDoc in internal/tn/spawn.go). That file is
+// the user's to edit: an untouched copy is refreshed when the contract
+// changes, an edited one is kept and the newer contract dropped beside it
+// as ORCHESTRATOR.md.new. TN_ORCHESTRATOR_DOC / serve.json "orchestratorDoc"
+// point spawns at a contract kept somewhere else entirely.
 package tasknotescli
 
 import _ "embed"
